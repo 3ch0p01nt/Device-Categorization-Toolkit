@@ -1,0 +1,168 @@
+// ============================================================================
+// DEVICE CATEGORIZATION - TEST QUERIES
+// ============================================================================
+// Run these queries INDIVIDUALLY to validate each component before running
+// the full combined query. Each should return results if you have the data.
+//
+// Copy ONE query at a time into Advanced Hunting and run it.
+// ============================================================================
+
+// ============================================================================
+// TEST 1: Base Tables Exist
+// Should return device count if DeviceInfo is populated
+// ============================================================================
+DeviceInfo
+| where Timestamp > ago(7d)
+| summarize DeviceCount = dcount(DeviceId)
+
+// ============================================================================
+// TEST 2: DeviceTvmSoftwareInventory Available
+// Should return software inventory if TVM is enabled
+// NOTE: This table requires Defender Vulnerability Management license
+// ============================================================================
+DeviceTvmSoftwareInventory
+| summarize SoftwareCount = dcount(SoftwareName), DeviceCount = dcount(DeviceId)
+
+// ============================================================================
+// TEST 3: Network Events Available
+// Should return network event types
+// ============================================================================
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| summarize Count = count() by ActionType
+| order by Count desc
+
+// ============================================================================
+// TEST 4: Process Events Available
+// Should return process execution data
+// ============================================================================
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| summarize ProcessCount = count(), UniqueProcesses = dcount(FileName)
+
+// ============================================================================
+// TEST 5: Identity Events Available (requires MDI)
+// Should return data if Defender for Identity is deployed
+// ============================================================================
+IdentityDirectoryEvents
+| where Timestamp > ago(7d)
+| summarize EventCount = count() by ActionType
+| order by EventCount desc
+
+// ============================================================================
+// TEST 6: Domain Controller Detection - Quick Test
+// Should identify DCs if any exist
+// ============================================================================
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where LocalPort == 88  // Kerberos
+| summarize
+    KerberosEvents = count(),
+    Devices = make_set(DeviceName)
+    by LocalIPType
+| where KerberosEvents > 10
+
+// ============================================================================
+// TEST 7: SQL Server Detection - Quick Test
+// Should find SQL servers by process
+// ============================================================================
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("sqlservr.exe", "sqlagent.exe")
+| summarize
+    ProcessCount = count(),
+    Devices = make_set(DeviceName)
+
+// ============================================================================
+// TEST 8: File Server Detection - Quick Test
+// Should find devices with heavy SMB traffic
+// ============================================================================
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where LocalPort == 445
+| summarize
+    SMBConnections = count(),
+    UniqueClients = dcount(RemoteIP)
+    by DeviceName
+| where SMBConnections > 50
+| order by SMBConnections desc
+| take 10
+
+// ============================================================================
+// TEST 9: Listening Ports Overview
+// Should show what services are running
+// ============================================================================
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ListeningConnectionCreated"
+| where LocalPort < 1024  // Well-known ports
+| summarize
+    Devices = dcount(DeviceName),
+    SampleDevices = make_set(DeviceName, 3)
+    by LocalPort
+| order by Devices desc
+
+// ============================================================================
+// TEST 10: DeviceInfo.DeviceType Values
+// Should show what native device types exist
+// ============================================================================
+DeviceInfo
+| where Timestamp > ago(7d)
+| summarize
+    DeviceCount = dcount(DeviceId),
+    SampleDevices = make_set(DeviceName, 5)
+    by DeviceType
+| order by DeviceCount desc
+
+// ============================================================================
+// TEST 11: Software Inventory - Server Software
+// Should find server software if TVM is enabled
+// ============================================================================
+DeviceTvmSoftwareInventory
+| where SoftwareName has_any ("sql_server", "exchange", "sharepoint", "iis")
+| summarize
+    DeviceCount = dcount(DeviceName),
+    Devices = make_set(DeviceName, 5)
+    by SoftwareName
+| order by DeviceCount desc
+
+// ============================================================================
+// TEST 12: Workstation Tool Detection
+// Should find admin/dev tools on workstations
+// ============================================================================
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName in~ ("devenv.exe", "Code.exe", "dsa.msc", "gpmc.msc", "PsExec.exe")
+| summarize
+    ToolUsage = count(),
+    Tools = make_set(FileName)
+    by DeviceName
+| order by ToolUsage desc
+| take 10
+
+// ============================================================================
+// MINI COMBINED TEST - Simplified version
+// This is a smaller version to test the overall logic works
+// ============================================================================
+let LookbackDays = 7;
+let BaseDevices = DeviceInfo
+    | where Timestamp > ago(LookbackDays * 1d)
+    | summarize arg_max(Timestamp, DeviceType, OSPlatform) by DeviceId, DeviceName;
+let DCs = DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LocalPort == 88
+    | distinct DeviceId, DeviceName
+    | extend Tier = 0, Category = "Domain Controller";
+let SQLServers = DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName =~ "sqlservr.exe"
+    | distinct DeviceId, DeviceName
+    | extend Tier = 1, Category = "SQL Server";
+let Categorized = union DCs, SQLServers;
+BaseDevices
+| join kind=leftouter Categorized on DeviceId, DeviceName
+| extend
+    Tier = coalesce(Tier, 99),
+    Category = coalesce(Category, "Uncategorized")
+| summarize DeviceCount = count() by Tier, Category
+| order by Tier asc

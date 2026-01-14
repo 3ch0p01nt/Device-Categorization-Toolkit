@@ -1,0 +1,316 @@
+// Device Categorization Toolkit - Combined Categorization Query
+// Purpose: Comprehensive device categorization combining all tiers
+// Target: Microsoft Defender XDR Advanced Hunting
+//
+// This is the main query to run for full device categorization.
+// Copy this entire query into Advanced Hunting and export the results.
+
+let LookbackDays = 30;
+
+// ============================================================================
+// BASE INVENTORY - All devices seen in the lookback period
+// ============================================================================
+let BaselineDevices =
+    DeviceInfo
+    | where Timestamp > ago(LookbackDays * 1d)
+    | summarize
+        LastSeen = max(Timestamp),
+        arg_max(Timestamp, OSPlatform, OSVersion, OSArchitecture, DeviceType,
+                MachineGroup, IsAzureADJoined, JoinType)
+        by DeviceId, DeviceName
+    | extend
+        IsServerOS = OSPlatform has_any ("Server", "WindowsServer")
+            or OSVersion has_any ("Server", "2016", "2019", "2022", "2012");
+
+// ============================================================================
+// TIER 0: CRITICAL IDENTITY INFRASTRUCTURE
+// ============================================================================
+
+// Domain Controllers
+let DomainControllers =
+    union
+        // Method 1: DeviceType
+        (DeviceInfo | where Timestamp > ago(LookbackDays * 1d) | where DeviceType == "DomainController"
+         | distinct DeviceId, DeviceName | extend Method = "DeviceType"),
+        // Method 2: Network ports (Kerberos + LDAP)
+        (DeviceNetworkEvents | where Timestamp > ago(LookbackDays * 1d)
+         | where ActionType == "ListeningConnectionCreated"
+         | where LocalPort in (88, 389, 636, 3268, 3269)
+         | summarize Ports = make_set(LocalPort) by DeviceId, DeviceName
+         | where Ports has 88 and (Ports has 389 or Ports has 636)
+         | extend Method = "NetworkPorts")
+    | summarize Methods = make_set(Method) by DeviceId, DeviceName
+    | extend Tier = 0, Category = "Domain Controller",
+             Confidence = iff(array_length(Methods) > 1, "High", "Medium"),
+             Evidence = strcat("Detection: ", tostring(Methods));
+
+// Certificate Authorities
+let CertificateAuthorities =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName =~ "certsvc.exe"
+    | summarize ProcessCount = count() by DeviceId, DeviceName
+    | where ProcessCount > 5
+    | extend Tier = 0, Category = "Certificate Authority",
+             Confidence = iff(ProcessCount > 50, "High", "Medium"),
+             Evidence = strcat("certsvc.exe count: ", ProcessCount);
+
+// AD FS Servers
+let ADFSServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName =~ "Microsoft.IdentityServer.ServiceHost.exe"
+    | summarize ProcessCount = count() by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend Tier = 0, Category = "AD FS Server",
+             Confidence = iff(ProcessCount > 100, "High", "Medium"),
+             Evidence = strcat("ADFS ServiceHost count: ", ProcessCount);
+
+// Entra Connect Servers
+let EntraConnectServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("miiserver.exe", "AzureADConnect.exe", "ADSync.exe")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend Tier = 0, Category = "Entra Connect Server",
+             Confidence = "High",
+             Evidence = strcat("Entra Connect processes: ", tostring(Processes));
+
+let Tier0 = union DomainControllers, CertificateAuthorities, ADFSServers, EntraConnectServers;
+
+// ============================================================================
+// TIER 1: BUSINESS CRITICAL SERVERS
+// ============================================================================
+
+// File Servers (high SMB traffic, not DCs)
+let FileServers =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LocalPort == 445
+    | where ActionType in ("InboundConnectionAccepted", "ConnectionSuccess")
+    | summarize SMBConnections = count(), UniqueClients = dcount(RemoteIP) by DeviceId, DeviceName
+    | where SMBConnections > 100 and UniqueClients > 5
+    | join kind=antijoin (DomainControllers | project DeviceId) on DeviceId
+    | extend Tier = 1, Category = "File Server",
+             Confidence = case(UniqueClients > 50, "High", UniqueClients > 20, "Medium", "Low"),
+             Evidence = strcat("SMB connections: ", SMBConnections, ", Clients: ", UniqueClients);
+
+// SQL Servers
+let SQLServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("sqlservr.exe", "sqlagent.exe")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 20
+    | extend Tier = 1, Category = "SQL Server",
+             Confidence = iff(ProcessCount > 200, "High", "Medium"),
+             Evidence = strcat("SQL processes: ", tostring(Processes), ", Count: ", ProcessCount);
+
+// Exchange Servers
+let ExchangeServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName has "MSExchange" or FileName =~ "EdgeTransport.exe"
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 50
+    | extend Tier = 1, Category = "Exchange Server",
+             Confidence = iff(ProcessCount > 500, "High", "Medium"),
+             Evidence = strcat("Exchange processes: ", tostring(Processes));
+
+// SharePoint Servers
+let SharePointServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("OWSTIMER.EXE", "SPUCWorkerProcess.exe")
+        or (FileName =~ "w3wp.exe" and ProcessCommandLine has "SharePoint")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 20
+    | extend Tier = 1, Category = "SharePoint Server",
+             Confidence = iff(ProcessCount > 200, "High", "Medium"),
+             Evidence = strcat("SharePoint processes: ", tostring(Processes));
+
+// Web Servers (IIS, not Exchange/SharePoint)
+let WebServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName =~ "w3wp.exe"
+    | where not(ProcessCommandLine has_any ("Exchange", "SharePoint", "SecurityToken"))
+    | summarize ProcessCount = count() by DeviceId, DeviceName
+    | where ProcessCount > 50
+    | join kind=antijoin (union ExchangeServers, SharePointServers | project DeviceId) on DeviceId
+    | extend Tier = 1, Category = "Web Server (IIS)",
+             Confidence = iff(ProcessCount > 500, "High", "Medium"),
+             Evidence = strcat("IIS w3wp count: ", ProcessCount);
+
+// Backup Servers
+let BackupServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("Veeam.Backup.Service.exe", "VeeamAgent.exe", "DPMRA.exe",
+                          "cvd.exe", "bprd.exe", "AcronisAgent.exe")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend Tier = 1, Category = "Backup Server",
+             Confidence = iff(ProcessCount > 100, "High", "Medium"),
+             Evidence = strcat("Backup processes: ", tostring(Processes));
+
+let Tier1 = union FileServers, SQLServers, ExchangeServers, SharePointServers, WebServers, BackupServers;
+
+// ============================================================================
+// TIER 2: STANDARD INFRASTRUCTURE
+// ============================================================================
+
+// WSUS Servers
+let WSUSServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName =~ "WsusService.exe"
+    | summarize ProcessCount = count() by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend Tier = 2, Category = "WSUS Server",
+             Confidence = iff(ProcessCount > 100, "High", "Medium"),
+             Evidence = strcat("WSUS process count: ", ProcessCount);
+
+// SCCM/MECM Servers
+let SCCMServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("smsexec.exe", "sitecomp.exe", "distmgr.exe", "smsdbmon.exe")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 20
+    | extend Tier = 2, Category = "SCCM Server",
+             Confidence = iff(ProcessCount > 200, "High", "Medium"),
+             Evidence = strcat("SCCM processes: ", tostring(Processes));
+
+// Print Servers
+let PrintServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName =~ "spoolsv.exe"
+    | summarize ProcessCount = count() by DeviceId, DeviceName
+    | where ProcessCount > 100
+    | join kind=inner (
+        DeviceNetworkEvents
+        | where Timestamp > ago(LookbackDays * 1d)
+        | where LocalPort == 445
+        | summarize PrintClients = dcount(RemoteIP) by DeviceId
+        | where PrintClients > 10
+    ) on DeviceId
+    | extend Tier = 2, Category = "Print Server",
+             Confidence = iff(PrintClients > 50, "High", "Medium"),
+             Evidence = strcat("Print spooler activity, Clients: ", PrintClients);
+
+// Jump Boxes / PAWs
+let JumpBoxes =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LocalPort == 3389 or RemotePort == 3389
+    | summarize
+        RDPInbound = countif(LocalPort == 3389),
+        RDPOutbound = countif(RemotePort == 3389),
+        InboundSources = dcountif(RemoteIP, LocalPort == 3389),
+        OutboundDests = dcountif(RemoteIP, RemotePort == 3389)
+        by DeviceId, DeviceName
+    | where RDPInbound > 50 and RDPOutbound > 20 // Both receiving and initiating RDP
+    | extend Tier = 2, Category = "Jump Box / PAW",
+             Confidence = case(RDPInbound > 200 and RDPOutbound > 100, "High", "Medium"),
+             Evidence = strcat("RDP In: ", RDPInbound, " from ", InboundSources, " sources, Out: ", RDPOutbound, " to ", OutboundDests, " dests");
+
+let Tier2 = union WSUSServers, SCCMServers, PrintServers, JumpBoxes;
+
+// ============================================================================
+// TIER 3: ENDPOINTS (WORKSTATIONS)
+// ============================================================================
+
+// IT Admin Workstations
+let AdminWorkstations =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("dsa.msc", "dnsmgmt.msc", "gpmc.msc", "ServerManager.exe", "PsExec.exe", "PsExec64.exe")
+        or (FileName =~ "powershell.exe" and ProcessCommandLine has_any ("Get-AD", "Set-AD", "ActiveDirectory"))
+    | summarize AdminToolCount = count(), Tools = make_set(FileName) by DeviceId, DeviceName
+    | where AdminToolCount > 20
+    | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId
+    | extend Tier = 3, Category = "IT Admin Workstation",
+             Confidence = iff(AdminToolCount > 100, "High", "Medium"),
+             Evidence = strcat("Admin tools: ", AdminToolCount, ", Tools: ", tostring(Tools));
+
+// Developer Workstations
+let DeveloperWorkstations =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("devenv.exe", "Code.exe", "rider64.exe", "idea64.exe", "pycharm64.exe",
+                          "cl.exe", "csc.exe", "dotnet.exe", "node.exe", "git.exe", "docker.exe")
+    | summarize DevToolCount = count(), Tools = make_set(FileName) by DeviceId, DeviceName
+    | where DevToolCount > 50
+    | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId
+    | extend Tier = 3, Category = "Developer Workstation",
+             Confidence = iff(DevToolCount > 500, "High", "Medium"),
+             Evidence = strcat("Dev tools: ", DevToolCount, ", Tools: ", tostring(Tools));
+
+// Kiosk / Shared Devices
+let SharedDevices =
+    DeviceLogonEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LogonType in ("Interactive", "RemoteInteractive")
+    | where AccountName !in~ ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE")
+    | summarize UniqueUsers = dcount(AccountName), Logons = count() by DeviceId, DeviceName
+    | where UniqueUsers >= 5
+    | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId
+    | extend Tier = 3, Category = "Kiosk / Shared Device",
+             Confidence = iff(UniqueUsers >= 15, "High", "Medium"),
+             Evidence = strcat("Unique users: ", UniqueUsers, ", Logons: ", Logons);
+
+// Standard Workstations (default for workstation OS with no other classification)
+let StandardWorkstations =
+    BaselineDevices
+    | where not(IsServerOS)
+    | project DeviceId, DeviceName
+    | join kind=antijoin (union AdminWorkstations, DeveloperWorkstations, SharedDevices | project DeviceId) on DeviceId
+    | extend Tier = 3, Category = "Standard Workstation",
+             Confidence = "Low",
+             Evidence = "Default: Workstation OS with no specialized classification";
+
+let Tier3 = union AdminWorkstations, DeveloperWorkstations, SharedDevices, StandardWorkstations;
+
+// ============================================================================
+// FINAL OUTPUT - Combine all tiers with priority
+// ============================================================================
+let AllCategorized = union Tier0, Tier1, Tier2, Tier3;
+
+// Join with baseline to get all devices and fill in uncategorized as "Unknown"
+let FinalOutput =
+    BaselineDevices
+    | join kind=leftouter (
+        AllCategorized
+        | summarize
+            arg_min(Tier, Category, Confidence, Evidence), // Take highest priority (lowest tier)
+            AllCategories = make_set(Category)
+            by DeviceId, DeviceName
+    ) on DeviceId, DeviceName
+    | extend
+        Tier = coalesce(Tier, 99),
+        Category = coalesce(Category, "Uncategorized"),
+        SecondaryCategory = iff(array_length(AllCategories) > 1,
+            strcat_array(array_slice(AllCategories, 1, array_length(AllCategories)), ", "), ""),
+        Confidence = coalesce(Confidence, "Low"),
+        Evidence = coalesce(Evidence, "No classification signals detected");
+
+// Output for export
+FinalOutput
+| project
+    DeviceName,
+    DeviceId,
+    Tier,
+    Category,
+    SecondaryCategory,
+    Confidence,
+    Evidence,
+    OSPlatform,
+    OSVersion,
+    MachineGroup,
+    LastSeen,
+    IsAzureADJoined,
+    JoinType
+| order by Tier asc, Category asc, DeviceName asc

@@ -1,0 +1,51 @@
+// Device Categorization Toolkit - Base Device Inventory
+// Purpose: Retrieve all active devices as the foundation for categorization
+// Target: Microsoft Defender XDR Advanced Hunting
+//
+// This query establishes the baseline inventory of all devices
+// that will be categorized by subsequent queries.
+
+let LookbackDays = 30; // Devices seen in the last N days
+let BaselineDevices =
+    DeviceInfo
+    | where Timestamp > ago(LookbackDays * 1d)
+    | summarize
+        LastSeen = max(Timestamp),
+        arg_max(Timestamp, OSPlatform, OSVersion, OSArchitecture, DeviceType,
+                MachineGroup, PublicIP, IsAzureADJoined, IsInternetFacing,
+                JoinType, LoggedOnUsers)
+        by DeviceId, DeviceName
+    | extend
+        // Normalize OS info for categorization
+        OSFamily = case(
+            OSPlatform has "Windows", "Windows",
+            OSPlatform has "Linux", "Linux",
+            OSPlatform has "macOS", "macOS",
+            "Other"
+        ),
+        // Flag server vs workstation OS
+        IsServerOS = case(
+            OSPlatform has_any ("WindowsServer", "Server"), true,
+            OSVersion has_any ("Server", "2016", "2019", "2022") and OSPlatform has "Windows", true,
+            false
+        ),
+        // Days since last seen
+        DaysSinceLastSeen = datetime_diff('day', now(), LastSeen)
+    | project
+        DeviceId,
+        DeviceName,
+        OSPlatform,
+        OSVersion,
+        OSArchitecture,
+        OSFamily,
+        IsServerOS,
+        DeviceType,
+        MachineGroup,
+        IsAzureADJoined,
+        JoinType,
+        IsInternetFacing,
+        LastSeen,
+        DaysSinceLastSeen;
+// Output the baseline inventory
+BaselineDevices
+| order by DeviceName asc

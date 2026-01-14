@@ -1,0 +1,239 @@
+// Device Categorization Toolkit - Tier 2 Detection
+// Purpose: Identify Infrastructure Servers (Print, WSUS/SCCM, Jump Boxes, DNS, DHCP)
+// Target: Microsoft Defender XDR Advanced Hunting
+//
+// Tier 2 = Standard Infrastructure
+// These systems provide supporting infrastructure services.
+
+let LookbackDays = 30;
+
+// ============================================================================
+// PRINT SERVER DETECTION
+// ============================================================================
+let PrintServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("spoolsv.exe", "PrintBrm.exe", "PrintIsolationHost.exe")
+        or ProcessCommandLine has_any ("printmanagement", "printers", "print$")
+    | summarize
+        SpoolsvCount = countif(FileName =~ "spoolsv.exe"),
+        ProcessCount = count(),
+        Processes = make_set(FileName)
+        by DeviceId, DeviceName
+    | join kind=leftouter (
+        // Check for remote print connections
+        DeviceNetworkEvents
+        | where Timestamp > ago(LookbackDays * 1d)
+        | where LocalPort in (135, 139, 445) // RPC/SMB for print
+        | summarize PrintConnections = count(), UniqueClients = dcount(RemoteIP) by DeviceId
+    ) on DeviceId
+    | where SpoolsvCount > 50 and (UniqueClients > 10 or isempty(UniqueClients))
+    | extend
+        Tier = 2,
+        Category = "Print Server",
+        Confidence = case(
+            UniqueClients > 50, "High",
+            UniqueClients > 20, "Medium",
+            "Low"
+        ),
+        Evidence = strcat("Spoolsv activity: ", SpoolsvCount, ", Print clients: ", coalesce(UniqueClients, 0));
+
+// ============================================================================
+// WSUS SERVER DETECTION
+// ============================================================================
+let WSUSServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("WsusService.exe", "WsusPool.exe")
+        or ProcessCommandLine has_any ("WSUS", "UpdateServices", "WsusContent")
+    | summarize
+        ProcessCount = count(),
+        Processes = make_set(FileName)
+        by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend
+        Tier = 2,
+        Category = "WSUS Server",
+        Confidence = iff(ProcessCount > 100, "High", "Medium"),
+        Evidence = strcat("WSUS Processes: ", tostring(Processes));
+
+// ============================================================================
+// SCCM/MECM SITE SERVER DETECTION
+// ============================================================================
+let SCCMServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ (
+        "smsexec.exe", "SMSExec.exe",               // SMS Executive
+        "hman.exe", "hierarcmgr.exe",               // Hierarchy Manager
+        "sitecomp.exe",                              // Site Component Manager
+        "distmgr.exe",                               // Distribution Manager
+        "dmpdownloader.exe",                         // Data Processing
+        "smsdbmon.exe",                              // Database Monitor
+        "despool.exe",                               // Despooler
+        "CCMEXEC.EXE"                                // Client but on servers can indicate MP
+    )
+        or ProcessCommandLine has_any ("ConfigMgr", "SCCM", "SMS_SITE")
+    | summarize
+        ProcessCount = count(),
+        Processes = make_set(FileName)
+        by DeviceId, DeviceName
+    | where ProcessCount > 20
+    | extend
+        // Determine if this is a Site Server vs Management Point vs Distribution Point
+        ServerRole = case(
+            Processes has_any ("smsexec", "sitecomp", "hman"), "Site Server",
+            Processes has_any ("smsdbmon"), "Site Server",
+            Processes has_any ("distmgr", "despool"), "Distribution Point",
+            "Management Point"
+        ),
+        Tier = 2,
+        Category = "SCCM Server",
+        Confidence = case(
+            ProcessCount > 200, "High",
+            ProcessCount > 50, "Medium",
+            "Low"
+        ),
+        Evidence = strcat("SCCM Role: ", ServerRole, ", Processes: ", tostring(Processes));
+
+// ============================================================================
+// JUMP BOX / PAW DETECTION
+// ============================================================================
+// Jump boxes have: inbound RDP, outbound RDP to other servers, admin tools
+let RDPInbound =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LocalPort == 3389 and ActionType in ("InboundConnectionAccepted", "ConnectionSuccess")
+    | summarize
+        RDPInboundCount = count(),
+        RDPSourceIPs = dcount(RemoteIP)
+        by DeviceId, DeviceName;
+
+let RDPOutbound =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where RemotePort == 3389 and ActionType in ("ConnectionSuccess", "ConnectionFound")
+    | summarize
+        RDPOutboundCount = count(),
+        RDPDestinations = dcount(RemoteIP)
+        by DeviceId, DeviceName;
+
+let AdminTools =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ (
+        "mstsc.exe",           // Remote Desktop
+        "PsExec.exe",          // PSExec
+        "PsExec64.exe",
+        "ServerManager.exe",   // Server Manager
+        "mmc.exe",             // Management Console
+        "dsa.msc",             // AD Users and Computers
+        "dnsmgmt.msc",         // DNS Manager
+        "dssite.msc",          // AD Sites and Services
+        "gpmc.msc"             // Group Policy Management
+    )
+    | summarize AdminToolUsage = count(), ToolsUsed = make_set(FileName) by DeviceId, DeviceName;
+
+let JumpBoxes =
+    RDPInbound
+    | join kind=inner RDPOutbound on DeviceId
+    | join kind=leftouter AdminTools on DeviceId
+    | where RDPInboundCount > 50 and RDPOutboundCount > 20 // Receiving RDP and initiating RDP
+    | extend
+        Tier = 2,
+        Category = "Jump Box / PAW",
+        Confidence = case(
+            RDPInboundCount > 200 and RDPOutboundCount > 100, "High",
+            AdminToolUsage > 50, "High",
+            "Medium"
+        ),
+        Evidence = strcat(
+            "RDP Inbound: ", RDPInboundCount, " from ", RDPSourceIPs, " sources, ",
+            "RDP Outbound: ", RDPOutboundCount, " to ", RDPDestinations, " destinations, ",
+            "Admin Tools: ", coalesce(tostring(ToolsUsed), "none")
+        );
+
+// ============================================================================
+// DNS SERVER DETECTION (non-DC)
+// ============================================================================
+// DNS servers that are NOT domain controllers
+let DNSServers =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LocalPort == 53 and ActionType == "ListeningConnectionCreated"
+    | summarize DNSListening = count() by DeviceId, DeviceName
+    | join kind=antijoin (
+        // Exclude Domain Controllers (they are Tier 0)
+        DeviceInfo
+        | where Timestamp > ago(LookbackDays * 1d)
+        | where DeviceType == "DomainController"
+        | distinct DeviceId
+    ) on DeviceId
+    | where DNSListening > 100
+    | extend
+        Tier = 2,
+        Category = "DNS Server",
+        Confidence = "Medium",
+        Evidence = strcat("DNS port 53 listening events: ", DNSListening);
+
+// ============================================================================
+// DHCP SERVER DETECTION
+// ============================================================================
+let DHCPServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("dhcpssvc.exe", "dhcpsvc.dll")
+        or ProcessCommandLine has "DHCPServer"
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend
+        Tier = 2,
+        Category = "DHCP Server",
+        Confidence = iff(ProcessCount > 50, "High", "Medium"),
+        Evidence = strcat("DHCP Processes: ", tostring(Processes));
+
+// ============================================================================
+// RADIUS / NPS SERVER DETECTION
+// ============================================================================
+let NPSServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("ias.exe", "iassvc.exe", "iashlpr.exe")
+        or ProcessCommandLine has_any ("NetworkPolicy", "IAS", "RADIUS")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend
+        Tier = 2,
+        Category = "NPS/RADIUS Server",
+        Confidence = iff(ProcessCount > 50, "High", "Medium"),
+        Evidence = strcat("NPS Processes: ", tostring(Processes));
+
+// ============================================================================
+// COMBINE ALL TIER 2 DETECTIONS
+// ============================================================================
+let Tier2Devices =
+    union PrintServers, WSUSServers, SCCMServers, JumpBoxes, DNSServers, DHCPServers, NPSServers
+    | summarize
+        Categories = make_set(Category),
+        MaxConfidence = max(Confidence),
+        AllEvidence = make_set(Evidence)
+        by DeviceId, DeviceName, Tier
+    | extend
+        PrimaryCategory = tostring(Categories[0]),
+        SecondaryCategories = iff(array_length(Categories) > 1,
+            strcat_array(array_slice(Categories, 1, array_length(Categories)), ", "),
+            ""),
+        Confidence = MaxConfidence,
+        Evidence = strcat_array(AllEvidence, " | ");
+
+// Output Tier 2 devices
+Tier2Devices
+| project
+    DeviceId,
+    DeviceName,
+    Tier,
+    Category = PrimaryCategory,
+    SecondaryCategory = SecondaryCategories,
+    Confidence,
+    Evidence
+| order by Category asc, DeviceName asc

@@ -1,0 +1,16 @@
+# Output files (CSV exports)
+output/*.csv
+
+# Keep output directory structure
+!output/.gitkeep
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

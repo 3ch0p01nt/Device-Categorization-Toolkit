@@ -1,0 +1,694 @@
+// Device Categorization Toolkit - ENHANCED Combined Categorization Query
+// Purpose: Comprehensive device categorization using BEST PRACTICE artifacts
+// Target: Microsoft Defender XDR Advanced Hunting
+//
+// ENHANCEMENTS based on research:
+// 1. DeviceTvmSoftwareInventory for definitive software-based role detection
+// 2. Improved DC detection using LocalIPType "FourToSixMapping" (Jeffrey Appel technique)
+// 3. IdentityDirectoryEvents from MDI for identity infrastructure detection
+// 4. DeviceInfo.DeviceType as primary classification signal
+// 5. Listening port patterns for service identification
+//
+// Copy this entire query into Advanced Hunting and export the results.
+
+let LookbackDays = 30;
+
+// ============================================================================
+// BASE INVENTORY - All devices with enhanced metadata
+// ============================================================================
+let BaselineDevices =
+    DeviceInfo
+    | where Timestamp > ago(LookbackDays * 1d)
+    | summarize
+        LastSeen = max(Timestamp),
+        arg_max(Timestamp, OSPlatform, OSVersion, OSArchitecture, DeviceType,
+                MachineGroup, IsAzureADJoined, JoinType, DeviceCategory,
+                AssetValue, ExposureLevel, IsInternetFacing)
+        by DeviceId, DeviceName
+    | extend
+        IsServerOS = OSPlatform has_any ("Server", "WindowsServer")
+            or OSVersion has_any ("Server", "2016", "2019", "2022", "2012"),
+        // Use native DeviceType when available
+        NativeDeviceType = DeviceType;
+
+// ============================================================================
+// SOFTWARE INVENTORY - Definitive role detection via installed software
+// ============================================================================
+// This is the MOST RELIABLE method for identifying server roles
+let SoftwareInventory =
+    DeviceTvmSoftwareInventory
+    | summarize
+        Software = make_set(SoftwareName),
+        SoftwareDetails = make_bag(pack(SoftwareName, SoftwareVersion))
+        by DeviceId, DeviceName;
+
+// SQL Server detection via software inventory
+let SQLServersBySoftware =
+    DeviceTvmSoftwareInventory
+    | where SoftwareName has_any ("sql_server", "microsoft_sql", "sqlserver")
+    | summarize
+        SQLVersions = make_set(strcat(SoftwareName, " ", SoftwareVersion))
+        by DeviceId, DeviceName
+    | extend
+        Tier = 1,
+        Category = "SQL Server",
+        Confidence = "High",
+        Evidence = strcat("Installed: ", tostring(SQLVersions)),
+        DetectionMethod = "SoftwareInventory";
+
+// Exchange Server detection via software inventory
+let ExchangeServersBySoftware =
+    DeviceTvmSoftwareInventory
+    | where SoftwareName has_any ("exchange_server", "microsoft_exchange")
+    | summarize
+        ExchangeVersions = make_set(strcat(SoftwareName, " ", SoftwareVersion))
+        by DeviceId, DeviceName
+    | extend
+        Tier = 1,
+        Category = "Exchange Server",
+        Confidence = "High",
+        Evidence = strcat("Installed: ", tostring(ExchangeVersions)),
+        DetectionMethod = "SoftwareInventory";
+
+// SharePoint Server detection via software inventory
+let SharePointServersBySoftware =
+    DeviceTvmSoftwareInventory
+    | where SoftwareName has_any ("sharepoint_server", "sharepoint_foundation")
+    | summarize
+        SharePointVersions = make_set(strcat(SoftwareName, " ", SoftwareVersion))
+        by DeviceId, DeviceName
+    | extend
+        Tier = 1,
+        Category = "SharePoint Server",
+        Confidence = "High",
+        Evidence = strcat("Installed: ", tostring(SharePointVersions)),
+        DetectionMethod = "SoftwareInventory";
+
+// IIS detection via software inventory
+let IISServersBySoftware =
+    DeviceTvmSoftwareInventory
+    | where SoftwareName has_any ("iis", "internet_information_services")
+    | summarize
+        IISVersions = make_set(strcat(SoftwareName, " ", SoftwareVersion))
+        by DeviceId, DeviceName
+    | extend
+        Tier = 1,
+        Category = "Web Server (IIS)",
+        Confidence = "High",
+        Evidence = strcat("Installed: ", tostring(IISVersions)),
+        DetectionMethod = "SoftwareInventory";
+
+// Backup software detection via software inventory
+let BackupServersBySoftware =
+    DeviceTvmSoftwareInventory
+    | where SoftwareName has_any ("veeam", "commvault", "veritas", "netbackup",
+                                   "acronis", "dpm", "azure_backup", "cohesity", "rubrik")
+    | summarize
+        BackupSoftware = make_set(strcat(SoftwareName, " ", SoftwareVersion))
+        by DeviceId, DeviceName
+    | extend
+        Tier = 1,
+        Category = "Backup Server",
+        Confidence = "High",
+        Evidence = strcat("Installed: ", tostring(BackupSoftware)),
+        DetectionMethod = "SoftwareInventory";
+
+// ============================================================================
+// TIER 0: CRITICAL IDENTITY INFRASTRUCTURE (Enhanced Detection)
+// ============================================================================
+
+// Domain Controllers - ENHANCED with multiple detection methods
+let DCsByDeviceType =
+    DeviceInfo
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where DeviceType == "DomainController"
+    | distinct DeviceId, DeviceName
+    | extend Method = "DeviceType";
+
+// Domain Controllers - Jeffrey Appel technique (FourToSixMapping on port 88)
+let DCsByKerberos =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LocalPort == 88
+    | where LocalIPType == "FourToSixMapping"
+    | distinct DeviceId, DeviceName
+    | extend Method = "Kerberos-FourToSixMapping";
+
+// Domain Controllers - Full DC port signature (88 + LDAP + DNS)
+let DCsByPortSignature =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where ActionType == "ListeningConnectionCreated"
+    | where LocalPort in (88, 389, 636, 53, 3268, 3269)
+    | summarize
+        Ports = make_set(LocalPort),
+        HasKerberos = countif(LocalPort == 88) > 0,
+        HasLDAP = countif(LocalPort in (389, 636)) > 0,
+        HasDNS = countif(LocalPort == 53) > 0,
+        HasGC = countif(LocalPort in (3268, 3269)) > 0
+        by DeviceId, DeviceName
+    | where HasKerberos and HasLDAP  // Must have both Kerberos AND LDAP
+    | extend Method = strcat("Ports:", tostring(Ports));
+
+// Domain Controllers - MDI IdentityDirectoryEvents (events processed BY DCs)
+let DCsByMDI =
+    IdentityDirectoryEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where isnotempty(DestinationDeviceName)
+    | summarize EventCount = count() by DestinationDeviceName
+    | where EventCount > 100  // DCs process many identity events
+    | extend DeviceName = DestinationDeviceName, Method = "MDI-IdentityEvents"
+    | join kind=inner (DeviceInfo | summarize arg_max(Timestamp, DeviceId) by DeviceName) on DeviceName
+    | project DeviceId, DeviceName, Method;
+
+// Combine all DC detection methods
+let DomainControllers =
+    union DCsByDeviceType, DCsByKerberos, DCsByPortSignature, DCsByMDI
+    | summarize Methods = make_set(Method) by DeviceId, DeviceName
+    | extend
+        Tier = 0,
+        Category = "Domain Controller",
+        Confidence = case(
+            array_length(Methods) >= 3, "High",
+            array_length(Methods) == 2, "High",
+            Methods has "DeviceType", "High",  // DeviceType is authoritative
+            "Medium"
+        ),
+        Evidence = strcat("Detection methods: ", tostring(Methods)),
+        DetectionMethod = "MultiSignal";
+
+// Certificate Authorities - Enhanced with software + process detection
+let CAsBySoftware =
+    DeviceTvmSoftwareInventory
+    | where SoftwareName has_any ("active_directory_certificate_services", "adcs", "certsvc")
+    | distinct DeviceId, DeviceName
+    | extend Method = "SoftwareInventory";
+
+let CAsByProcess =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName =~ "certsvc.exe"
+    | summarize ProcessCount = count() by DeviceId, DeviceName
+    | where ProcessCount > 5
+    | extend Method = strcat("certsvc.exe:", ProcessCount);
+
+let CertificateAuthorities =
+    union CAsBySoftware, CAsByProcess
+    | summarize Methods = make_set(Method) by DeviceId, DeviceName
+    | extend
+        Tier = 0,
+        Category = "Certificate Authority",
+        Confidence = iff(array_length(Methods) > 1, "High", "Medium"),
+        Evidence = strcat("Detection: ", tostring(Methods)),
+        DetectionMethod = "MultiSignal";
+
+// AD FS Servers - Enhanced
+let ADFSByProcess =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("Microsoft.IdentityServer.ServiceHost.exe", "AdfsSrv.exe")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend Method = strcat("Processes:", tostring(Processes));
+
+let ADFSByPort =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where ActionType == "ListeningConnectionCreated"
+    | where LocalPort in (443, 49443)  // ADFS ports
+    | summarize Ports = make_set(LocalPort) by DeviceId, DeviceName
+    | where Ports has 443
+    | extend Method = "ADFSPorts";
+
+let ADFSServers =
+    union ADFSByProcess, ADFSByPort
+    | summarize Methods = make_set(Method) by DeviceId, DeviceName
+    | where Methods has_any ("Processes", "Microsoft.IdentityServer")  // Must have process evidence
+    | extend
+        Tier = 0,
+        Category = "AD FS Server",
+        Confidence = iff(array_length(Methods) > 1, "High", "Medium"),
+        Evidence = strcat("Detection: ", tostring(Methods)),
+        DetectionMethod = "MultiSignal";
+
+// Entra Connect Servers - Enhanced
+let EntraConnectServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("miiserver.exe", "AzureADConnect.exe", "ADSync.exe",
+                          "Microsoft.Identity.Health.AadSync.MonitoringAgent.exe")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend
+        Tier = 0,
+        Category = "Entra Connect Server",
+        Confidence = "High",
+        Evidence = strcat("Entra Connect processes: ", tostring(Processes)),
+        DetectionMethod = "ProcessBased";
+
+let Tier0 = union DomainControllers, CertificateAuthorities, ADFSServers, EntraConnectServers;
+
+// ============================================================================
+// TIER 1: BUSINESS CRITICAL SERVERS (Enhanced with Software Inventory)
+// ============================================================================
+
+// SQL Servers - Combined software + process detection
+let SQLServersByProcess =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("sqlservr.exe", "sqlagent.exe", "sqlwriter.exe", "SQLAGENT.EXE")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 20
+    | extend
+        Tier = 1, Category = "SQL Server",
+        Confidence = iff(ProcessCount > 200, "High", "Medium"),
+        Evidence = strcat("SQL processes: ", tostring(Processes), " (", ProcessCount, " events)"),
+        DetectionMethod = "ProcessBased";
+
+let SQLServers = union SQLServersBySoftware, SQLServersByProcess
+    | summarize arg_max(Confidence, *) by DeviceId, DeviceName;
+
+// Exchange Servers - Combined software + process detection
+let ExchangeServersByProcess =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName has "MSExchange"
+        or FileName in~ ("EdgeTransport.exe", "Microsoft.Exchange.Store.Worker.exe")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 50
+    | extend
+        Tier = 1, Category = "Exchange Server",
+        Confidence = iff(ProcessCount > 500, "High", "Medium"),
+        Evidence = strcat("Exchange processes: ", tostring(Processes)),
+        DetectionMethod = "ProcessBased";
+
+let ExchangeServers = union ExchangeServersBySoftware, ExchangeServersByProcess
+    | summarize arg_max(Confidence, *) by DeviceId, DeviceName;
+
+// SharePoint Servers - Combined software + process detection
+let SharePointServersByProcess =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("OWSTIMER.EXE", "SPUCWorkerProcess.exe", "noderunner.exe")
+        or (FileName =~ "w3wp.exe" and ProcessCommandLine has "SharePoint")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 20
+    | extend
+        Tier = 1, Category = "SharePoint Server",
+        Confidence = iff(ProcessCount > 200, "High", "Medium"),
+        Evidence = strcat("SharePoint processes: ", tostring(Processes)),
+        DetectionMethod = "ProcessBased";
+
+let SharePointServers = union SharePointServersBySoftware, SharePointServersByProcess
+    | summarize arg_max(Confidence, *) by DeviceId, DeviceName;
+
+// Web Servers (IIS) - Combined software + process + port detection
+let WebServersByProcess =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName =~ "w3wp.exe"
+    | where not(ProcessCommandLine has_any ("Exchange", "SharePoint", "SecurityToken"))
+    | summarize ProcessCount = count() by DeviceId, DeviceName
+    | where ProcessCount > 50
+    | extend
+        Tier = 1, Category = "Web Server (IIS)",
+        Confidence = iff(ProcessCount > 500, "High", "Medium"),
+        Evidence = strcat("IIS w3wp count: ", ProcessCount),
+        DetectionMethod = "ProcessBased";
+
+let WebServersByPort =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where ActionType == "ListeningConnectionCreated"
+    | where LocalPort in (80, 443, 8080, 8443)
+    | summarize Ports = make_set(LocalPort), Connections = count() by DeviceId, DeviceName
+    | where Connections > 100
+    | extend
+        Tier = 1, Category = "Web Server",
+        Confidence = "Medium",
+        Evidence = strcat("HTTP ports listening: ", tostring(Ports)),
+        DetectionMethod = "PortBased";
+
+let WebServers = union IISServersBySoftware, WebServersByProcess
+    | join kind=antijoin (union ExchangeServers, SharePointServers | project DeviceId) on DeviceId
+    | summarize arg_max(Confidence, *) by DeviceId, DeviceName;
+
+// File Servers - SMB traffic analysis (enhanced thresholds)
+let FileServers =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LocalPort == 445
+    | where ActionType in ("InboundConnectionAccepted", "ConnectionSuccess", "ListeningConnectionCreated")
+    | summarize
+        SMBConnections = count(),
+        UniqueClients = dcount(RemoteIP),
+        SampleClients = make_set(RemoteIP, 5)
+        by DeviceId, DeviceName
+    | where SMBConnections > 100 and UniqueClients > 5
+    | join kind=antijoin (DomainControllers | project DeviceId) on DeviceId
+    | extend
+        Tier = 1,
+        Category = "File Server",
+        Confidence = case(
+            UniqueClients > 100, "High",
+            UniqueClients > 50, "High",
+            UniqueClients > 20, "Medium",
+            "Low"
+        ),
+        Evidence = strcat("SMB: ", SMBConnections, " connections from ", UniqueClients, " clients"),
+        DetectionMethod = "NetworkBehavior";
+
+// Database Servers (MySQL, PostgreSQL, Oracle) - Port + Process based
+let OtherDatabaseServers =
+    union
+        // MySQL
+        (DeviceNetworkEvents
+         | where Timestamp > ago(LookbackDays * 1d)
+         | where ActionType == "ListeningConnectionCreated" and LocalPort == 3306
+         | distinct DeviceId, DeviceName
+         | extend DBType = "MySQL"),
+        // PostgreSQL
+        (DeviceNetworkEvents
+         | where Timestamp > ago(LookbackDays * 1d)
+         | where ActionType == "ListeningConnectionCreated" and LocalPort == 5432
+         | distinct DeviceId, DeviceName
+         | extend DBType = "PostgreSQL"),
+        // Oracle
+        (DeviceNetworkEvents
+         | where Timestamp > ago(LookbackDays * 1d)
+         | where ActionType == "ListeningConnectionCreated" and LocalPort == 1521
+         | distinct DeviceId, DeviceName
+         | extend DBType = "Oracle"),
+        // Process-based
+        (DeviceProcessEvents
+         | where Timestamp > ago(LookbackDays * 1d)
+         | where FileName in~ ("mysqld.exe", "postgres.exe", "oracle.exe", "mongod.exe")
+         | summarize Processes = make_set(FileName) by DeviceId, DeviceName
+         | extend DBType = tostring(Processes))
+    | summarize DBTypes = make_set(DBType) by DeviceId, DeviceName
+    | extend
+        Tier = 1,
+        Category = strcat("Database Server (", strcat_array(DBTypes, ", "), ")"),
+        Confidence = "Medium",
+        Evidence = strcat("Database indicators: ", tostring(DBTypes)),
+        DetectionMethod = "PortAndProcess";
+
+// Backup Servers - Combined software + process
+let BackupServersByProcess =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("Veeam.Backup.Service.exe", "VeeamAgent.exe", "Veeam.Backup.Manager.exe",
+                          "DPMRA.exe", "msdpm.exe", "cvd.exe", "ClMgrS.exe",
+                          "bprd.exe", "bpdbm.exe", "AcronisAgent.exe")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend
+        Tier = 1, Category = "Backup Server",
+        Confidence = iff(ProcessCount > 100, "High", "Medium"),
+        Evidence = strcat("Backup processes: ", tostring(Processes)),
+        DetectionMethod = "ProcessBased";
+
+let BackupServers = union BackupServersBySoftware, BackupServersByProcess
+    | summarize arg_max(Confidence, *) by DeviceId, DeviceName;
+
+let Tier1 = union SQLServers, ExchangeServers, SharePointServers, WebServers,
+                  FileServers, OtherDatabaseServers, BackupServers;
+
+// ============================================================================
+// TIER 2: STANDARD INFRASTRUCTURE (Enhanced)
+// ============================================================================
+
+// WSUS Servers
+let WSUSServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("WsusService.exe", "WsusPool.exe")
+    | summarize ProcessCount = count() by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend
+        Tier = 2, Category = "WSUS Server",
+        Confidence = iff(ProcessCount > 100, "High", "Medium"),
+        Evidence = strcat("WSUS process count: ", ProcessCount),
+        DetectionMethod = "ProcessBased";
+
+// SCCM/MECM Servers
+let SCCMServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("smsexec.exe", "sitecomp.exe", "distmgr.exe", "smsdbmon.exe",
+                          "hman.exe", "hierarcmgr.exe")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 20
+    | extend
+        Tier = 2, Category = "SCCM Server",
+        Confidence = iff(ProcessCount > 200, "High", "Medium"),
+        Evidence = strcat("SCCM processes: ", tostring(Processes)),
+        DetectionMethod = "ProcessBased";
+
+// Print Servers - Enhanced detection
+let PrintServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("spoolsv.exe", "PrintIsolationHost.exe")
+    | summarize ProcessCount = count() by DeviceId, DeviceName
+    | where ProcessCount > 100
+    | join kind=inner (
+        DeviceNetworkEvents
+        | where Timestamp > ago(LookbackDays * 1d)
+        | where LocalPort == 445 or LocalPort == 9100  // SMB + RAW printing
+        | summarize PrintClients = dcount(RemoteIP) by DeviceId
+        | where PrintClients > 10
+    ) on DeviceId
+    | extend
+        Tier = 2, Category = "Print Server",
+        Confidence = iff(PrintClients > 50, "High", "Medium"),
+        Evidence = strcat("Print spooler + ", PrintClients, " clients"),
+        DetectionMethod = "ProcessAndNetwork";
+
+// Jump Boxes / PAWs - Enhanced with admin tool correlation
+let JumpBoxes =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LocalPort == 3389 or RemotePort == 3389
+    | summarize
+        RDPInbound = countif(LocalPort == 3389),
+        RDPOutbound = countif(RemotePort == 3389),
+        InboundSources = dcountif(RemoteIP, LocalPort == 3389),
+        OutboundDests = dcountif(RemoteIP, RemotePort == 3389)
+        by DeviceId, DeviceName
+    | where RDPInbound > 50 and RDPOutbound > 20
+    | join kind=leftouter (
+        DeviceProcessEvents
+        | where Timestamp > ago(LookbackDays * 1d)
+        | where FileName in~ ("mstsc.exe", "PsExec.exe", "PsExec64.exe", "ServerManager.exe")
+        | summarize AdminTools = dcount(FileName) by DeviceId
+    ) on DeviceId
+    | extend
+        Tier = 2,
+        Category = "Jump Box / PAW",
+        Confidence = case(
+            RDPInbound > 200 and RDPOutbound > 100 and AdminTools > 2, "High",
+            RDPInbound > 200 and RDPOutbound > 100, "High",
+            AdminTools > 2, "High",
+            "Medium"
+        ),
+        Evidence = strcat("RDP In:", RDPInbound, " Out:", RDPOutbound, " AdminTools:", coalesce(AdminTools, 0)),
+        DetectionMethod = "NetworkBehavior";
+
+// DNS Servers (non-DC)
+let DNSServers =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where ActionType == "ListeningConnectionCreated"
+    | where LocalPort == 53
+    | summarize DNSEvents = count() by DeviceId, DeviceName
+    | where DNSEvents > 50
+    | join kind=antijoin (DomainControllers | project DeviceId) on DeviceId
+    | extend
+        Tier = 2, Category = "DNS Server",
+        Confidence = iff(DNSEvents > 500, "High", "Medium"),
+        Evidence = strcat("DNS port 53 listening: ", DNSEvents, " events"),
+        DetectionMethod = "PortBased";
+
+// DHCP Servers
+let DHCPServers =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where ActionType == "ListeningConnectionCreated"
+    | where LocalPort in (67, 68)  // DHCP ports
+    | summarize DHCPEvents = count() by DeviceId, DeviceName
+    | where DHCPEvents > 10
+    | extend
+        Tier = 2, Category = "DHCP Server",
+        Confidence = "Medium",
+        Evidence = strcat("DHCP ports listening: ", DHCPEvents, " events"),
+        DetectionMethod = "PortBased";
+
+let Tier2 = union WSUSServers, SCCMServers, PrintServers, JumpBoxes, DNSServers, DHCPServers;
+
+// ============================================================================
+// TIER 3: ENDPOINTS (WORKSTATIONS) - Enhanced Detection
+// ============================================================================
+
+// IT Admin Workstations - Enhanced with more tool signatures
+let AdminWorkstations =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ (
+        // MMC Snap-ins
+        "dsa.msc", "dnsmgmt.msc", "gpmc.msc", "dhcpmgmt.msc", "certsrv.msc",
+        "dssite.msc", "dfsmgmt.msc", "adfs.msc",
+        // Admin Tools
+        "ServerManager.exe", "PsExec.exe", "PsExec64.exe", "mmc.exe",
+        "RSAT.exe", "dsac.exe", "ldp.exe",
+        // Remote tools
+        "mstsc.exe", "msra.exe"
+    )
+        or (FileName =~ "powershell.exe" and ProcessCommandLine has_any (
+            "Get-AD", "Set-AD", "New-AD", "Remove-AD", "Import-Module ActiveDirectory",
+            "Get-GPO", "Get-DNS", "Get-DHCP", "Get-Exchange"
+        ))
+    | summarize AdminToolCount = count(), Tools = make_set(FileName) by DeviceId, DeviceName
+    | where AdminToolCount > 20
+    | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId
+    | extend
+        Tier = 3, Category = "IT Admin Workstation",
+        Confidence = iff(AdminToolCount > 100, "High", "Medium"),
+        Evidence = strcat("Admin tools: ", AdminToolCount, " events, Tools: ", tostring(Tools)),
+        DetectionMethod = "ToolUsage";
+
+// Developer Workstations - Enhanced with more dev tools
+let DeveloperWorkstations =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ (
+        // IDEs
+        "devenv.exe", "Code.exe", "Code - Insiders.exe", "rider64.exe", "idea64.exe",
+        "pycharm64.exe", "webstorm64.exe", "goland64.exe", "clion64.exe",
+        "eclipse.exe", "atom.exe", "sublime_text.exe", "notepad++.exe",
+        // Compilers & Runtimes
+        "cl.exe", "csc.exe", "vbc.exe", "fsc.exe", "javac.exe", "java.exe",
+        "python.exe", "python3.exe", "node.exe", "npm.cmd", "npm.exe",
+        "dotnet.exe", "go.exe", "rustc.exe", "cargo.exe",
+        // Build & Package Tools
+        "msbuild.exe", "gradle.exe", "mvn.cmd", "make.exe", "cmake.exe",
+        "yarn.exe", "pnpm.exe", "pip.exe", "pip3.exe",
+        // DevOps & Containers
+        "docker.exe", "docker-compose.exe", "kubectl.exe", "helm.exe",
+        "terraform.exe", "az.cmd", "aws.exe", "gcloud.exe",
+        // Version Control
+        "git.exe", "git-bash.exe", "svn.exe", "gh.exe"
+    )
+    | summarize DevToolCount = count(), Tools = make_set(FileName) by DeviceId, DeviceName
+    | where DevToolCount > 50
+    | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId
+    | extend
+        Tier = 3, Category = "Developer Workstation",
+        Confidence = iff(DevToolCount > 500, "High", "Medium"),
+        Evidence = strcat("Dev tools: ", DevToolCount, " events, Tools: ", tostring(Tools)),
+        DetectionMethod = "ToolUsage";
+
+// Security Analyst Workstations - NEW category
+let SecurityAnalystWorkstations =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ (
+        // Security tools
+        "Wireshark.exe", "tshark.exe", "procmon.exe", "procexp.exe",
+        "autoruns.exe", "tcpview.exe", "Fiddler.exe", "burpsuite.exe",
+        "x64dbg.exe", "x32dbg.exe", "IDA64.exe", "ghidra.exe",
+        "nmap.exe", "masscan.exe", "sqlmap.exe"
+    )
+    | summarize SecToolCount = count(), Tools = make_set(FileName) by DeviceId, DeviceName
+    | where SecToolCount > 10
+    | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId
+    | extend
+        Tier = 3, Category = "Security Analyst Workstation",
+        Confidence = iff(SecToolCount > 50, "High", "Medium"),
+        Evidence = strcat("Security tools: ", tostring(Tools)),
+        DetectionMethod = "ToolUsage";
+
+// Kiosk / Shared Devices
+let SharedDevices =
+    DeviceLogonEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LogonType in ("Interactive", "RemoteInteractive", "Unlock")
+    | where AccountName !in~ ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "DWM-1", "UMFD-0")
+    | summarize
+        UniqueUsers = dcount(AccountName),
+        Logons = count(),
+        Users = make_set(AccountName, 10)
+        by DeviceId, DeviceName
+    | where UniqueUsers >= 5
+    | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId
+    | extend
+        Tier = 3, Category = "Kiosk / Shared Device",
+        Confidence = iff(UniqueUsers >= 15, "High", "Medium"),
+        Evidence = strcat("Unique users: ", UniqueUsers, ", Sample: ", tostring(Users)),
+        DetectionMethod = "LogonBehavior";
+
+// Standard Workstations (default)
+let StandardWorkstations =
+    BaselineDevices
+    | where not(IsServerOS)
+    | where DeviceType in ("Workstation", "") or isempty(DeviceType)
+    | project DeviceId, DeviceName
+    | join kind=antijoin (
+        union AdminWorkstations, DeveloperWorkstations, SecurityAnalystWorkstations, SharedDevices
+        | project DeviceId
+    ) on DeviceId
+    | extend
+        Tier = 3, Category = "Standard Workstation",
+        Confidence = "Low",
+        Evidence = "Default: Workstation OS with no specialized classification",
+        DetectionMethod = "Default";
+
+let Tier3 = union AdminWorkstations, DeveloperWorkstations, SecurityAnalystWorkstations,
+                  SharedDevices, StandardWorkstations;
+
+// ============================================================================
+// FINAL OUTPUT - Combine all tiers with priority
+// ============================================================================
+let AllCategorized = union Tier0, Tier1, Tier2, Tier3;
+
+let FinalOutput =
+    BaselineDevices
+    | join kind=leftouter (
+        AllCategorized
+        | summarize
+            arg_min(Tier, Category, Confidence, Evidence, DetectionMethod),
+            AllCategories = make_set(Category)
+            by DeviceId, DeviceName
+    ) on DeviceId, DeviceName
+    | extend
+        Tier = coalesce(Tier, 99),
+        Category = coalesce(Category, "Uncategorized"),
+        SecondaryCategory = iff(array_length(AllCategories) > 1,
+            strcat_array(array_slice(AllCategories, 1, array_length(AllCategories)), ", "), ""),
+        Confidence = coalesce(Confidence, "Low"),
+        Evidence = coalesce(Evidence, "No classification signals detected"),
+        DetectionMethod = coalesce(DetectionMethod, "None");
+
+// Output for export
+FinalOutput
+| project
+    DeviceName,
+    DeviceId,
+    Tier,
+    Category,
+    SecondaryCategory,
+    Confidence,
+    DetectionMethod,
+    Evidence,
+    // Device metadata
+    NativeDeviceType,
+    OSPlatform,
+    OSVersion,
+    MachineGroup,
+    AssetValue,
+    ExposureLevel,
+    IsInternetFacing,
+    LastSeen,
+    IsAzureADJoined,
+    JoinType
+| order by Tier asc, Category asc, DeviceName asc

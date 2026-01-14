@@ -1,0 +1,253 @@
+// Device Categorization Toolkit - Tier 1 Detection
+// Purpose: Identify Business Critical Servers (File, Database, Exchange, SharePoint, Web, Backup)
+// Target: Microsoft Defender XDR Advanced Hunting
+//
+// Tier 1 = Business Critical Servers
+// These systems host critical business data and applications.
+
+let LookbackDays = 30;
+
+// ============================================================================
+// FILE SERVER DETECTION
+// ============================================================================
+// Identify servers with high SMB traffic (port 445) from multiple sources
+let FileServers =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LocalPort == 445 // SMB
+    | where ActionType in ("InboundConnectionAccepted", "ConnectionSuccess")
+    | summarize
+        SMBConnections = count(),
+        UniqueClients = dcount(RemoteIP),
+        SampleClients = make_set(RemoteIP, 10)
+        by DeviceId, DeviceName
+    | where SMBConnections > 100 and UniqueClients > 5 // Threshold for file server activity
+    | extend
+        Tier = 1,
+        Category = "File Server",
+        Confidence = case(
+            UniqueClients > 50 and SMBConnections > 1000, "High",
+            UniqueClients > 20, "Medium",
+            "Low"
+        ),
+        Evidence = strcat("SMB Connections: ", SMBConnections, ", Unique Clients: ", UniqueClients);
+
+// ============================================================================
+// DATABASE SERVER DETECTION
+// ============================================================================
+// SQL Server
+let SQLServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("sqlservr.exe", "sqlwriter.exe", "sqlbrowser.exe", "sqlagent.exe",
+                          "SQLAGENT.EXE", "SQLAgent.exe")
+    | summarize
+        ProcessCount = count(),
+        Processes = make_set(FileName)
+        by DeviceId, DeviceName
+    | where ProcessCount > 10 // Must be consistently running
+    | extend
+        Tier = 1,
+        Category = "SQL Server",
+        Confidence = iff(ProcessCount > 100, "High", "Medium"),
+        Evidence = strcat("SQL Processes: ", tostring(Processes), ", Count: ", ProcessCount);
+
+// MySQL
+let MySQLServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("mysqld.exe", "mysqld", "mysql.exe")
+        or ProcessCommandLine has "mysqld"
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend
+        Tier = 1,
+        Category = "MySQL Server",
+        Confidence = iff(ProcessCount > 100, "High", "Medium"),
+        Evidence = strcat("MySQL Processes: ", tostring(Processes));
+
+// PostgreSQL
+let PostgreSQLServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("postgres.exe", "pg_ctl.exe", "postmaster.exe")
+        or ProcessCommandLine has "postgres"
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend
+        Tier = 1,
+        Category = "PostgreSQL Server",
+        Confidence = iff(ProcessCount > 100, "High", "Medium"),
+        Evidence = strcat("PostgreSQL Processes: ", tostring(Processes));
+
+// Oracle
+let OracleServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("oracle.exe", "tnslsnr.exe", "oracleservice.exe")
+        or ProcessCommandLine has_any ("oracle", "tnslsnr", "ORACLE_HOME")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend
+        Tier = 1,
+        Category = "Oracle Server",
+        Confidence = iff(ProcessCount > 100, "High", "Medium"),
+        Evidence = strcat("Oracle Processes: ", tostring(Processes));
+
+// Combine all database servers
+let DatabaseServers =
+    union SQLServers, MySQLServers, PostgreSQLServers, OracleServers;
+
+// ============================================================================
+// EXCHANGE SERVER DETECTION
+// ============================================================================
+let ExchangeServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName has_any ("MSExchange", "EdgeTransport", "ExSetup")
+        or FileName in~ ("Microsoft.Exchange.Store.Worker.exe",
+                         "Microsoft.Exchange.EdgeSyncSvc.exe",
+                         "MSExchangeTransport.exe",
+                         "MSExchangeHMHost.exe",
+                         "MSExchangeFrontendTransport.exe")
+        or ProcessCommandLine has "Exchange"
+    | summarize
+        ProcessCount = count(),
+        ExchangeProcesses = make_set(FileName)
+        by DeviceId, DeviceName
+    | where ProcessCount > 50
+    | extend
+        Tier = 1,
+        Category = "Exchange Server",
+        Confidence = case(
+            ProcessCount > 500, "High",
+            ProcessCount > 100, "Medium",
+            "Low"
+        ),
+        Evidence = strcat("Exchange Processes: ", tostring(ExchangeProcesses));
+
+// ============================================================================
+// SHAREPOINT SERVER DETECTION
+// ============================================================================
+let SharePointServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("OWSTIMER.EXE", "SPUCWorkerProcess.exe", "SPUCHostService.exe",
+                          "noderunner.exe", "OWSTimerService.exe")
+        or (FileName =~ "w3wp.exe" and ProcessCommandLine has_any (
+            "SharePoint", "SPSearchHost", "SecurityTokenServiceApp"))
+        or ProcessCommandLine has_any ("SharePoint", "SPFarm", "SPWebApplication")
+    | summarize
+        ProcessCount = count(),
+        SharePointProcesses = make_set(FileName)
+        by DeviceId, DeviceName
+    | where ProcessCount > 20
+    | extend
+        Tier = 1,
+        Category = "SharePoint Server",
+        Confidence = case(
+            ProcessCount > 200, "High",
+            ProcessCount > 50, "Medium",
+            "Low"
+        ),
+        Evidence = strcat("SharePoint Processes: ", tostring(SharePointProcesses));
+
+// ============================================================================
+// WEB SERVER (IIS) DETECTION
+// ============================================================================
+// Note: We exclude Exchange and SharePoint which also use w3wp.exe
+let WebServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("w3wp.exe", "iisexpress.exe", "InetMgr.exe", "WAS.exe")
+    | where not(ProcessCommandLine has_any ("Exchange", "SharePoint", "SecurityTokenService"))
+    | summarize
+        W3WPCount = countif(FileName =~ "w3wp.exe"),
+        Processes = make_set(FileName),
+        AppPools = make_set(extract(@"-ap\s+""?([^""]+)""?", 1, ProcessCommandLine))
+        by DeviceId, DeviceName
+    | where W3WPCount > 50
+    | extend
+        Tier = 1,
+        Category = "Web Server (IIS)",
+        Confidence = case(
+            W3WPCount > 500, "High",
+            W3WPCount > 100, "Medium",
+            "Low"
+        ),
+        Evidence = strcat("IIS w3wp count: ", W3WPCount, ", App Pools: ", tostring(AppPools));
+
+// ============================================================================
+// BACKUP SERVER DETECTION
+// ============================================================================
+let BackupServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ (
+        // Veeam
+        "Veeam.Backup.Service.exe", "VeeamAgent.exe", "Veeam.Backup.Manager.exe",
+        "VeeamDeploymentSvc.exe", "Veeam.Backup.CatalogDataService.exe",
+        // Commvault
+        "cvd.exe", "ClMgrS.exe", "cvfwd.exe",
+        // Veritas/Symantec NetBackup
+        "bprd.exe", "bpdbm.exe", "nbemm.exe",
+        // Microsoft DPM
+        "DPMRA.exe", "msdpm.exe", "DPMBackupWriter.exe",
+        // Acronis
+        "AcronisAgent.exe", "TrueImageHomeService.exe",
+        // Cohesity
+        "CohesityAgent.exe",
+        // Rubrik
+        "RubrikConnector.exe"
+    )
+    | summarize
+        ProcessCount = count(),
+        BackupProcesses = make_set(FileName)
+        by DeviceId, DeviceName
+    | where ProcessCount > 10
+    | extend
+        BackupProduct = case(
+            BackupProcesses has_any ("Veeam"), "Veeam",
+            BackupProcesses has_any ("cvd", "ClMgrS"), "Commvault",
+            BackupProcesses has_any ("bprd", "nbemm"), "Veritas NetBackup",
+            BackupProcesses has_any ("DPMRA", "msdpm"), "Microsoft DPM",
+            BackupProcesses has_any ("Acronis"), "Acronis",
+            BackupProcesses has_any ("Cohesity"), "Cohesity",
+            BackupProcesses has_any ("Rubrik"), "Rubrik",
+            "Unknown Backup Product"
+        ),
+        Tier = 1,
+        Category = "Backup Server",
+        Confidence = iff(ProcessCount > 100, "High", "Medium"),
+        Evidence = strcat("Backup Product: ", BackupProduct, ", Processes: ", tostring(BackupProcesses));
+
+// ============================================================================
+// COMBINE ALL TIER 1 DETECTIONS
+// ============================================================================
+let Tier1Devices =
+    union FileServers, DatabaseServers, ExchangeServers, SharePointServers, WebServers, BackupServers
+    | summarize
+        Categories = make_set(Category),
+        MaxConfidence = max(Confidence),
+        AllEvidence = make_set(Evidence)
+        by DeviceId, DeviceName, Tier
+    | extend
+        // Primary category is the first detected
+        PrimaryCategory = tostring(Categories[0]),
+        SecondaryCategories = iff(array_length(Categories) > 1,
+            strcat_array(array_slice(Categories, 1, array_length(Categories)), ", "),
+            ""),
+        Confidence = MaxConfidence,
+        Evidence = strcat_array(AllEvidence, " | ");
+
+// Output Tier 1 devices
+Tier1Devices
+| project
+    DeviceId,
+    DeviceName,
+    Tier,
+    Category = PrimaryCategory,
+    SecondaryCategory = SecondaryCategories,
+    Confidence,
+    Evidence
+| order by Category asc, DeviceName asc

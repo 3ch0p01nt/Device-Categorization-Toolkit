@@ -1,0 +1,174 @@
+// Device Categorization Toolkit - Tier 0 Detection
+// Purpose: Identify Domain Controllers, Certificate Authorities, AD FS, Entra Connect
+// Target: Microsoft Defender XDR Advanced Hunting
+//
+// Tier 0 = Critical Identity Infrastructure
+// These are the most sensitive systems in the environment.
+
+let LookbackDays = 30;
+
+// ============================================================================
+// DOMAIN CONTROLLER DETECTION
+// ============================================================================
+// Method 1: From Defender for Identity (IdentityInfo table)
+let DCsFromMDI =
+    IdentityInfo
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where Tags has "Domain Controller" or AccountDomain != ""
+    | join kind=inner (
+        DeviceInfo
+        | where Timestamp > ago(LookbackDays * 1d)
+        | summarize arg_max(Timestamp, *) by DeviceId, DeviceName
+    ) on $left.AccountUpn == $right.DeviceName
+    | distinct DeviceId, DeviceName
+    | extend DetectionMethod = "MDI-Identity";
+
+// Method 2: From DeviceInfo where DeviceType indicates DC
+let DCsFromDeviceType =
+    DeviceInfo
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where DeviceType == "DomainController"
+    | summarize arg_max(Timestamp, *) by DeviceId, DeviceName
+    | distinct DeviceId, DeviceName
+    | extend DetectionMethod = "DeviceType";
+
+// Method 3: Network traffic patterns - Listening on DC ports
+let DCsFromNetwork =
+    DeviceNetworkEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where ActionType == "ListeningConnectionCreated"
+    | where LocalPort in (88, 389, 636, 3268, 3269) // Kerberos, LDAP, LDAPS, GC
+    | summarize
+        KerberosListening = countif(LocalPort == 88),
+        LDAPListening = countif(LocalPort in (389, 636)),
+        GCListening = countif(LocalPort in (3268, 3269)),
+        Ports = make_set(LocalPort)
+        by DeviceId, DeviceName
+    | where KerberosListening > 0 and LDAPListening > 0 // Must have both
+    | extend DetectionMethod = "NetworkPorts"
+    | project DeviceId, DeviceName, DetectionMethod, Evidence = strcat("Ports: ", tostring(Ports));
+
+// Method 4: Process-based detection - AD DS service
+let DCsFromProcesses =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("ntdsutil.exe", "dsdbutil.exe", "ntds.dit")
+        or ProcessCommandLine has_any ("ntdsutil", "dsdbutil", "ntds.dit")
+        or (FileName =~ "lsass.exe" and ProcessCommandLine has "adws")
+    | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
+    | extend DetectionMethod = "ADProcesses"
+    | project DeviceId, DeviceName, DetectionMethod, Evidence = strcat("Processes: ", tostring(Processes));
+
+// Combine DC detection methods
+let DomainControllers =
+    union
+        (DCsFromDeviceType | extend Evidence = "DeviceType=DomainController"),
+        (DCsFromNetwork),
+        (DCsFromProcesses)
+    | summarize
+        DetectionMethods = make_set(DetectionMethod),
+        AllEvidence = make_set(Evidence)
+        by DeviceId, DeviceName
+    | extend
+        Tier = 0,
+        Category = "Domain Controller",
+        Confidence = case(
+            array_length(DetectionMethods) >= 3, "High",
+            array_length(DetectionMethods) == 2, "High",
+            "Medium"
+        ),
+        Evidence = strcat_array(AllEvidence, "; ");
+
+// ============================================================================
+// CERTIFICATE AUTHORITY DETECTION
+// ============================================================================
+let CertificateAuthorities =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("certsvc.exe", "certsrv.exe", "certutil.exe")
+        or (ProcessCommandLine has_any ("-ca", "-config", "CertSvc"))
+    | summarize
+        CertSvcCount = countif(FileName =~ "certsvc.exe"),
+        CertUtilCount = countif(FileName =~ "certutil.exe"),
+        Processes = make_set(FileName)
+        by DeviceId, DeviceName
+    | where CertSvcCount > 0 // certsvc.exe is the actual CA service
+    | extend
+        Tier = 0,
+        Category = "Certificate Authority",
+        Confidence = iff(CertSvcCount > 10, "High", "Medium"),
+        Evidence = strcat("CA Processes: ", tostring(Processes));
+
+// ============================================================================
+// AD FS DETECTION
+// ============================================================================
+let ADFSServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("Microsoft.IdentityServer.ServiceHost.exe", "AdfsSrv.exe")
+        or ProcessCommandLine has_any ("ADFS", "IdentityServer", "FederationService")
+    | summarize
+        ProcessCount = count(),
+        Processes = make_set(FileName)
+        by DeviceId, DeviceName
+    | extend
+        Tier = 0,
+        Category = "AD FS Server",
+        Confidence = iff(ProcessCount > 50, "High", "Medium"),
+        Evidence = strcat("ADFS Processes: ", tostring(Processes));
+
+// ============================================================================
+// ENTRA CONNECT (Azure AD Connect) DETECTION
+// ============================================================================
+let EntraConnectServers =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ ("AzureADConnect.exe", "miiserver.exe", "miiserver.dll",
+                          "ADSync.exe", "Microsoft.Azure.ActiveDirectory.Synchronization.exe")
+        or ProcessCommandLine has_any ("AzureADConnect", "AADConnect", "ADSync", "miiserver")
+    | summarize
+        ProcessCount = count(),
+        Processes = make_set(FileName)
+        by DeviceId, DeviceName
+    | extend
+        Tier = 0,
+        Category = "Entra Connect Server",
+        Confidence = iff(ProcessCount > 20, "High", "Medium"),
+        Evidence = strcat("Entra Connect Processes: ", tostring(Processes));
+
+// ============================================================================
+// COMBINE ALL TIER 0 DETECTIONS
+// ============================================================================
+let Tier0Devices =
+    union DomainControllers, CertificateAuthorities, ADFSServers, EntraConnectServers
+    | summarize
+        Categories = make_set(Category),
+        MaxConfidence = max(Confidence),
+        AllEvidence = make_set(Evidence)
+        by DeviceId, DeviceName, Tier
+    | extend
+        // Primary category is the first detected (priority: DC > CA > ADFS > Entra)
+        PrimaryCategory = case(
+            Categories has "Domain Controller", "Domain Controller",
+            Categories has "Certificate Authority", "Certificate Authority",
+            Categories has "AD FS Server", "AD FS Server",
+            Categories has "Entra Connect Server", "Entra Connect Server",
+            tostring(Categories[0])
+        ),
+        SecondaryCategories = iff(array_length(Categories) > 1,
+            strcat_array(array_slice(Categories, 1, array_length(Categories)), ", "),
+            ""),
+        Confidence = MaxConfidence,
+        Evidence = strcat_array(AllEvidence, " | ");
+
+// Output Tier 0 devices
+Tier0Devices
+| project
+    DeviceId,
+    DeviceName,
+    Tier,
+    Category = PrimaryCategory,
+    SecondaryCategory = SecondaryCategories,
+    Confidence,
+    Evidence
+| order by Category asc, DeviceName asc

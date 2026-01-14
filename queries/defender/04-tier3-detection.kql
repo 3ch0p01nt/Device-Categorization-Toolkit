@@ -1,0 +1,243 @@
+// Device Categorization Toolkit - Tier 3 Detection
+// Purpose: Identify Workstation Types (IT Admin, Developer, Standard, Kiosk/Shared)
+// Target: Microsoft Defender XDR Advanced Hunting
+//
+// Tier 3 = Endpoints (Workstations)
+// Standard user devices categorized by usage patterns.
+
+let LookbackDays = 30;
+
+// ============================================================================
+// IT ADMIN WORKSTATION DETECTION
+// ============================================================================
+// Admin workstations have RSAT tools, admin consoles, elevated PS, privileged user logons
+let AdminToolUsage =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ (
+        // RSAT Tools
+        "dsa.msc", "dssite.msc", "dnsmgmt.msc", "dhcpmgmt.msc",
+        "gpmc.msc", "certsrv.msc", "adfs.msc", "dfsmgmt.msc",
+        // Admin Consoles
+        "ServerManager.exe", "mmc.exe", "compmgmt.msc", "devmgmt.msc",
+        "diskmgmt.msc", "eventvwr.msc", "fsmgmt.msc", "lusrmgr.msc",
+        "services.msc", "gpedit.msc", "secpol.msc",
+        // Remote Admin Tools
+        "mstsc.exe", "PsExec.exe", "PsExec64.exe", "LAPS.exe",
+        // AD PowerShell Module usage
+        "dsac.exe", "ADUC.exe"
+    )
+        or (FileName =~ "powershell.exe" and ProcessCommandLine has_any (
+            "ActiveDirectory", "Get-AD", "Set-AD", "New-AD", "Remove-AD",
+            "Get-GPO", "Get-DNS", "Get-DHCP", "Import-Module AD"
+        ))
+    | summarize
+        AdminToolCount = count(),
+        ToolsUsed = make_set(FileName),
+        ADPowerShell = countif(ProcessCommandLine has "ActiveDirectory")
+        by DeviceId, DeviceName;
+
+let AdminWorkstations =
+    AdminToolUsage
+    | where AdminToolCount > 20 or ADPowerShell > 5
+    | join kind=leftouter (
+        // Verify workstation OS (not server)
+        DeviceInfo
+        | where Timestamp > ago(LookbackDays * 1d)
+        | where OSPlatform has "Windows10" or OSPlatform has "Windows11"
+        | summarize arg_max(Timestamp, OSPlatform) by DeviceId
+    ) on DeviceId
+    | where isnotempty(OSPlatform) // Must be workstation OS
+    | extend
+        Tier = 3,
+        Category = "IT Admin Workstation",
+        Confidence = case(
+            AdminToolCount > 100 and ADPowerShell > 20, "High",
+            AdminToolCount > 50, "High",
+            "Medium"
+        ),
+        Evidence = strcat(
+            "Admin Tools: ", AdminToolCount, ", ",
+            "AD PowerShell: ", ADPowerShell, ", ",
+            "Tools: ", tostring(ToolsUsed)
+        );
+
+// ============================================================================
+// DEVELOPER WORKSTATION DETECTION
+// ============================================================================
+let DeveloperWorkstations =
+    DeviceProcessEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where FileName in~ (
+        // IDEs
+        "devenv.exe",          // Visual Studio
+        "Code.exe",            // VS Code
+        "rider64.exe",         // JetBrains Rider
+        "idea64.exe",          // IntelliJ IDEA
+        "pycharm64.exe",       // PyCharm
+        "webstorm64.exe",      // WebStorm
+        "eclipse.exe",         // Eclipse
+        "atom.exe",            // Atom
+        "sublime_text.exe",    // Sublime Text
+        // Compilers / Runtimes
+        "cl.exe",              // MSVC Compiler
+        "csc.exe",             // C# Compiler
+        "vbc.exe",             // VB Compiler
+        "javac.exe",           // Java Compiler
+        "gcc.exe", "g++.exe",  // GCC
+        "python.exe",          // Python
+        "node.exe",            // Node.js
+        "dotnet.exe",          // .NET CLI
+        "go.exe",              // Go
+        "rustc.exe",           // Rust
+        // Build Tools
+        "msbuild.exe",         // MSBuild
+        "npm.cmd", "npm.exe",  // NPM
+        "yarn.exe",            // Yarn
+        "gradle.exe",          // Gradle
+        "mvn.cmd",             // Maven
+        // DevOps Tools
+        "docker.exe",          // Docker
+        "kubectl.exe",         // Kubernetes
+        "terraform.exe",       // Terraform
+        "az.cmd", "az.exe",    // Azure CLI
+        "aws.exe",             // AWS CLI
+        // Version Control
+        "git.exe",             // Git
+        "svn.exe",             // SVN
+        "TortoiseProc.exe"     // TortoiseGit/SVN
+    )
+    | summarize
+        DevToolCount = count(),
+        IDECount = countif(FileName in~ ("devenv.exe", "Code.exe", "rider64.exe", "idea64.exe", "pycharm64.exe")),
+        CompilerCount = countif(FileName in~ ("cl.exe", "csc.exe", "javac.exe", "gcc.exe", "rustc.exe")),
+        ToolsUsed = make_set(FileName)
+        by DeviceId, DeviceName
+    | where DevToolCount > 50 and (IDECount > 10 or CompilerCount > 5)
+    | join kind=leftouter (
+        DeviceInfo
+        | where Timestamp > ago(LookbackDays * 1d)
+        | where OSPlatform has "Windows10" or OSPlatform has "Windows11"
+        | summarize arg_max(Timestamp, OSPlatform) by DeviceId
+    ) on DeviceId
+    | where isnotempty(OSPlatform)
+    | extend
+        Tier = 3,
+        Category = "Developer Workstation",
+        Confidence = case(
+            DevToolCount > 500 and IDECount > 100, "High",
+            DevToolCount > 200, "High",
+            "Medium"
+        ),
+        Evidence = strcat(
+            "Dev Tools: ", DevToolCount, ", ",
+            "IDE Usage: ", IDECount, ", ",
+            "Compilers: ", CompilerCount, ", ",
+            "Tools: ", tostring(ToolsUsed)
+        );
+
+// ============================================================================
+// KIOSK / SHARED DEVICE DETECTION
+// ============================================================================
+// Devices with many different users logging in interactively
+let SharedDevices =
+    DeviceLogonEvents
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where LogonType in ("Interactive", "RemoteInteractive", "Unlock")
+    | where isnotempty(AccountName) and AccountName !in~ ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE")
+    | summarize
+        UniqueUsers = dcount(AccountName),
+        LogonCount = count(),
+        Users = make_set(AccountName, 20)
+        by DeviceId, DeviceName
+    | where UniqueUsers >= 5 // 5+ different users on one device suggests shared
+    | join kind=leftouter (
+        DeviceInfo
+        | where Timestamp > ago(LookbackDays * 1d)
+        | where OSPlatform has "Windows10" or OSPlatform has "Windows11"
+        | summarize arg_max(Timestamp, OSPlatform) by DeviceId
+    ) on DeviceId
+    | where isnotempty(OSPlatform)
+    | extend
+        Tier = 3,
+        Category = "Kiosk / Shared Device",
+        Confidence = case(
+            UniqueUsers >= 20, "High",
+            UniqueUsers >= 10, "High",
+            "Medium"
+        ),
+        Evidence = strcat(
+            "Unique Users: ", UniqueUsers, ", ",
+            "Total Logons: ", LogonCount, ", ",
+            "Sample Users: ", tostring(Users)
+        );
+
+// ============================================================================
+// STANDARD WORKSTATION (DEFAULT)
+// ============================================================================
+// Workstations that don't fit other categories - normal Office/browser usage
+let StandardWorkstations =
+    DeviceInfo
+    | where Timestamp > ago(LookbackDays * 1d)
+    | where OSPlatform has "Windows10" or OSPlatform has "Windows11"
+    | summarize arg_max(Timestamp, *) by DeviceId, DeviceName
+    | join kind=leftouter (
+        DeviceProcessEvents
+        | where Timestamp > ago(LookbackDays * 1d)
+        | where FileName in~ (
+            // Office Apps
+            "WINWORD.EXE", "EXCEL.EXE", "POWERPNT.EXE", "OUTLOOK.EXE", "ONENOTE.EXE",
+            "MSACCESS.EXE", "Teams.exe", "ms-teams.exe",
+            // Browsers
+            "chrome.exe", "msedge.exe", "firefox.exe", "iexplore.exe",
+            // Common apps
+            "explorer.exe", "notepad.exe", "calc.exe"
+        )
+        | summarize
+            OfficeUsage = countif(FileName in~ ("WINWORD.EXE", "EXCEL.EXE", "POWERPNT.EXE", "OUTLOOK.EXE")),
+            BrowserUsage = countif(FileName in~ ("chrome.exe", "msedge.exe", "firefox.exe")),
+            TeamsUsage = countif(FileName in~ ("Teams.exe", "ms-teams.exe"))
+            by DeviceId
+    ) on DeviceId
+    | where OfficeUsage > 10 or BrowserUsage > 50 or TeamsUsage > 10
+    | extend
+        Tier = 3,
+        Category = "Standard Workstation",
+        Confidence = "Medium",
+        Evidence = strcat(
+            "Office Usage: ", coalesce(OfficeUsage, 0), ", ",
+            "Browser Usage: ", coalesce(BrowserUsage, 0), ", ",
+            "Teams Usage: ", coalesce(TeamsUsage, 0)
+        )
+    | project DeviceId, DeviceName, Tier, Category, Confidence, Evidence;
+
+// ============================================================================
+// COMBINE ALL TIER 3 DETECTIONS
+// ============================================================================
+// Priority: IT Admin > Developer > Kiosk > Standard
+let Tier3Devices =
+    union
+        (AdminWorkstations | extend Priority = 1),
+        (DeveloperWorkstations | extend Priority = 2),
+        (SharedDevices | extend Priority = 3),
+        (StandardWorkstations | extend Priority = 4)
+    | summarize
+        arg_min(Priority, Category, Confidence, Evidence),
+        AllCategories = make_set(Category)
+        by DeviceId, DeviceName, Tier
+    | extend
+        SecondaryCategories = iff(array_length(AllCategories) > 1,
+            strcat_array(array_slice(AllCategories, 1, array_length(AllCategories)), ", "),
+            "");
+
+// Output Tier 3 devices
+Tier3Devices
+| project
+    DeviceId,
+    DeviceName,
+    Tier,
+    Category,
+    SecondaryCategory = SecondaryCategories,
+    Confidence,
+    Evidence
+| order by Category asc, DeviceName asc

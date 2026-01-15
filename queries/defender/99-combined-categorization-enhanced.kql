@@ -330,7 +330,7 @@ let WebServersByPort =
         DetectionMethod = "PortBased";
 
 let WebServers = union IISServersBySoftware, WebServersByProcess
-    | join kind=antijoin (union ExchangeServers, SharePointServers | project DeviceId) on DeviceId
+    | join kind=leftanti (union ExchangeServers, SharePointServers | project DeviceId) on DeviceId
     | summarize arg_max(Confidence, *) by DeviceId, DeviceName;
 
 // File Servers - SMB traffic analysis (enhanced thresholds)
@@ -345,7 +345,7 @@ let FileServers =
         SampleClients = make_set(RemoteIP, 5)
         by DeviceId, DeviceName
     | where SMBConnections > 100 and UniqueClients > 5
-    | join kind=antijoin (DomainControllers | project DeviceId) on DeviceId
+    | join kind=leftanti (DomainControllers | project DeviceId) on DeviceId
     | extend
         Tier = 1,
         Category = "File Server",
@@ -503,7 +503,7 @@ let DNSServers =
     | where LocalPort == 53
     | summarize DNSEvents = count() by DeviceId, DeviceName
     | where DNSEvents > 50
-    | join kind=antijoin (DomainControllers | project DeviceId) on DeviceId
+    | join kind=leftanti (DomainControllers | project DeviceId) on DeviceId
     | extend
         Tier = 2, Category = "DNS Server",
         Confidence = iff(DNSEvents > 500, "High", "Medium"),
@@ -633,7 +633,7 @@ let StandardWorkstations =
     | where not(IsServerOS)
     | where DeviceType in ("Workstation", "") or isempty(DeviceType)
     | project DeviceId, DeviceName
-    | join kind=antijoin (
+    | join kind=leftanti (
         union AdminWorkstations, DeveloperWorkstations, SecurityAnalystWorkstations, SharedDevices
         | project DeviceId
     ) on DeviceId

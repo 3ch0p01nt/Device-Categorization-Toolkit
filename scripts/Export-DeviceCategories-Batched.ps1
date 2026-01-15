@@ -67,19 +67,23 @@
       - SCCM Server: System Center Configuration Manager (endpoint management)
       - Jump Box / PAW: High RDP inbound AND outbound (admin access point)
 
-    Tier 3 - Endpoints (user devices)
+    Tier 2 - Infrastructure (network and server infrastructure)
+      - Network Infrastructure: DEFAULT for NativeDeviceType="NetworkDevice" (routers, switches, firewalls, APs)
+      - General Purpose Server: DEFAULT for NativeDeviceType="Server" with no specific
+        role detected. These are Windows Servers without identified workloads.
+
+    Tier 3 - Endpoints (user devices and specialized equipment)
       - IT Admin Workstation: Frequent use of admin tools (RSAT, mmc.exe, PsExec)
       - Developer Workstation: Frequent use of dev tools (VS, VSCode, git, docker)
       - Security Analyst Workstation: Frequent use of security tools (Wireshark, procmon)
       - Kiosk / Shared Device: 5+ unique interactive user logons
       - Standard Workstation: DEFAULT for NativeDeviceType="Workstation" with no signals
-      - AudioAndVideo Device: DEFAULT for NativeDeviceType="AudioAndVideo" (Teams Rooms, etc.)
-      - NetworkDevice Device: DEFAULT for NativeDeviceType="NetworkDevice"
-      - Unknown Device Type: DEFAULT when NativeDeviceType is empty or unknown
-
-    Tier 2 - Default for uncategorized servers
-      - General Purpose Server: DEFAULT for NativeDeviceType="Server" with no specific
-        role detected. These are Windows Servers without identified workloads.
+      - Printer: DEFAULT for NativeDeviceType="Printer"
+      - Mobile Device: DEFAULT for NativeDeviceType="Mobile" (phones, tablets)
+      - IoT Device: DEFAULT for NativeDeviceType="IoT" (cameras, sensors)
+      - Communication Device: DEFAULT for NativeDeviceType="Communication" (VoIP, video conferencing)
+      - OT Device: DEFAULT for NativeDeviceType="Operational Technology" or "Industrial"
+      - Unknown Device: DEFAULT when NativeDeviceType is empty or "Unknown"
 #>
 
 [CmdletBinding()]
@@ -310,14 +314,19 @@ let AdminWorkstations = DeviceProcessEvents | where Timestamp > ago(LookbackDays
 let DeveloperWorkstations = DeviceProcessEvents | where Timestamp > ago(LookbackDays * 1d) | where FileName in~ ("devenv.exe", "Code.exe", "rider64.exe", "idea64.exe", "pycharm64.exe", "git.exe", "node.exe", "python.exe", "docker.exe", "dotnet.exe", "npm.exe") | summarize DevToolCount = count(), Tools = make_set(FileName) by DeviceId, DeviceName | where DevToolCount > 50 | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId | extend Tier = 3, Category = "Developer Workstation", Confidence = iff(DevToolCount > 500, "High", "Medium"), DetectionMethod = "ToolUsage", Evidence = strcat("Runs dev tools (", tostring(Tools), ") - has access to source code and deployment pipelines.");
 let SecurityWorkstations = DeviceProcessEvents | where Timestamp > ago(LookbackDays * 1d) | where FileName in~ ("Wireshark.exe", "procmon.exe", "procexp.exe", "autoruns.exe", "tcpview.exe", "Fiddler.exe", "nmap.exe") | summarize SecToolCount = count() by DeviceId, DeviceName | where SecToolCount > 10 | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId | extend Tier = 3, Category = "Security Analyst Workstation", Confidence = iff(SecToolCount > 50, "High", "Medium"), DetectionMethod = "ToolUsage", Evidence = "Runs security analysis tools - used for security operations.";
 let SharedDevices = DeviceLogonEvents | where Timestamp > ago(LookbackDays * 1d) | where LogonType in ("Interactive", "RemoteInteractive") | where AccountName !in~ ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE") | summarize UniqueUsers = dcount(AccountName) by DeviceId, DeviceName | where UniqueUsers >= 5 | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId | extend Tier = 3, Category = "Kiosk / Shared Device", Confidence = iff(UniqueUsers >= 15, "High", "Medium"), DetectionMethod = "LogonBehavior", Evidence = strcat(UniqueUsers, " users logged in - shared device (conference room, training lab, kiosk).");
-let GenericServers = BaselineDevices | where IsServerOS | project DeviceId, DeviceName | extend Tier = 2, Category = "Generic Server", Confidence = "Low", DetectionMethod = "OSBased", Evidence = "Server OS detected but no specific role identified.";
-let StandardWorkstations = BaselineDevices | where not(IsServerOS) | project DeviceId, DeviceName | extend Tier = 3, Category = "Standard Workstation", Confidence = "Low", DetectionMethod = "Default", Evidence = "Standard endpoint with no specialized role detected.";
+let GenericServers = BaselineDevices | where IsServerOS | where NativeDeviceType =~ "Server" or isempty(NativeDeviceType) | project DeviceId, DeviceName | extend Tier = 2, Category = "Generic Server", Confidence = "Low", DetectionMethod = "OSBased", Evidence = "Server OS detected but no specific role identified.";
+let StandardWorkstations = BaselineDevices | where not(IsServerOS) | where NativeDeviceType =~ "Workstation" or isempty(NativeDeviceType) | project DeviceId, DeviceName | extend Tier = 3, Category = "Standard Workstation", Confidence = "Low", DetectionMethod = "Default", Evidence = "Standard endpoint with no specialized role detected.";
+let NetworkInfrastructure = BaselineDevices | where NativeDeviceType =~ "NetworkDevice" | project DeviceId, DeviceName | extend Tier = 2, Category = "Network Infrastructure", Confidence = "Medium", DetectionMethod = "DeviceType", Evidence = "Defender identifies as network device (router, switch, firewall, AP).";
+let PrinterDevices = BaselineDevices | where NativeDeviceType =~ "Printer" | project DeviceId, DeviceName | extend Tier = 3, Category = "Printer", Confidence = "Medium", DetectionMethod = "DeviceType", Evidence = "Defender identifies as printer device.";
+let MobileDevices = BaselineDevices | where NativeDeviceType =~ "Mobile" | project DeviceId, DeviceName | extend Tier = 3, Category = "Mobile Device", Confidence = "Medium", DetectionMethod = "DeviceType", Evidence = "Defender identifies as mobile device (phone, tablet).";
+let IoTDevices = BaselineDevices | where NativeDeviceType in~ ("IoT", "Communication", "Operational Technology", "Industrial") | project DeviceId, DeviceName, NativeDeviceType | extend Tier = 3, Category = case(NativeDeviceType =~ "Communication", "Communication Device", NativeDeviceType =~ "Operational Technology", "OT Device", NativeDeviceType =~ "Industrial", "Industrial Control System", "IoT Device"), Confidence = "Medium", DetectionMethod = "DeviceType", Evidence = strcat("Defender identifies as ", NativeDeviceType, " (VoIP, camera, sensor, or industrial equipment).");
+let UnknownDevices = BaselineDevices | where NativeDeviceType =~ "Unknown" | project DeviceId, DeviceName | extend Tier = 3, Category = "Unknown Device", Confidence = "Low", DetectionMethod = "Default", Evidence = "Device type could not be determined by Defender.";
 let AllCategorized = union DomainControllers, CertificateAuthorities, ADFSServers, EntraConnectServers, SQLServers, ExchangeServers, SharePointServers, WebServers, FileServers, BackupServers, WSUSServers, SCCMServers, JumpBoxes, AdminWorkstations, DeveloperWorkstations, SecurityWorkstations, SharedDevices;
 let Tier0 = union DomainControllers, CertificateAuthorities, ADFSServers, EntraConnectServers;
 let Tier1 = union SQLServers, ExchangeServers, SharePointServers, WebServers, FileServers, BackupServers;
-let Tier2 = union WSUSServers, SCCMServers, JumpBoxes, GenericServers;
-let Tier3 = union AdminWorkstations, DeveloperWorkstations, SecurityWorkstations, SharedDevices, StandardWorkstations;
-let AllWithFallback = union AllCategorized, (BaselineDevices | join kind=leftanti (AllCategorized | project DeviceId) on DeviceId | extend Tier = iff(IsServerOS, 2, 3), Category = iff(IsServerOS, "Generic Server", "Standard Workstation"), Confidence = "Low", DetectionMethod = "Default", Evidence = iff(IsServerOS, "Server OS - no specific role detected", "Standard endpoint"));
+let Tier2 = union WSUSServers, SCCMServers, JumpBoxes, GenericServers, NetworkInfrastructure;
+let Tier3 = union AdminWorkstations, DeveloperWorkstations, SecurityWorkstations, SharedDevices, StandardWorkstations, PrinterDevices, MobileDevices, IoTDevices, UnknownDevices;
+let AllWithFallback = union AllCategorized, (BaselineDevices | join kind=leftanti (AllCategorized | project DeviceId) on DeviceId | extend Tier = case(NativeDeviceType =~ "NetworkDevice", 2, IsServerOS, 2, 3), Category = case(NativeDeviceType =~ "Workstation", "Standard Workstation", NativeDeviceType =~ "Server", "General Purpose Server", NativeDeviceType =~ "DomainController", "Domain Controller", NativeDeviceType =~ "NetworkDevice", "Network Infrastructure", NativeDeviceType =~ "Printer", "Printer", NativeDeviceType =~ "Mobile", "Mobile Device", NativeDeviceType =~ "IoT", "IoT Device", NativeDeviceType =~ "Communication", "Communication Device", NativeDeviceType in~ ("Operational Technology", "Industrial"), "OT Device", isempty(NativeDeviceType) or NativeDeviceType =~ "Unknown", "Unknown Device", strcat(NativeDeviceType, " Device")), Confidence = "Low", DetectionMethod = "Default", Evidence = "Categorized by NativeDeviceType - no specific role detected.");
 AllWithFallback
 | summarize arg_min(Tier, Category, Confidence, Evidence, DetectionMethod), AllCategories = make_set(Category) by DeviceId, DeviceName
 | join kind=leftouter (BaselineDevices | project DeviceId, DeviceName, OSPlatform, OSVersion, NativeDeviceType, MachineGroup, LastSeen, IsAzureADJoined, JoinType) on DeviceId, DeviceName

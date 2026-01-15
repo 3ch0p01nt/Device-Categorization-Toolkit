@@ -627,12 +627,11 @@ let SharedDevices =
         Evidence = strcat("Unique users: ", UniqueUsers, ", Sample: ", tostring(Users)),
         DetectionMethod = "LogonBehavior";
 
-// Standard Workstations (default)
+// Standard Workstations (default for non-server OS)
 // IMPORTANT: Exclude ALL higher-tier devices to prevent dual categorization
 let StandardWorkstations =
     BaselineDevices
     | where not(IsServerOS)
-    | where DeviceType in ("Workstation", "") or isempty(DeviceType)
     | project DeviceId, DeviceName
     | join kind=leftanti (
         union
@@ -648,8 +647,23 @@ let StandardWorkstations =
         Evidence = "Default: Workstation OS with no specialized classification",
         DetectionMethod = "Default";
 
+// Generic Servers (fallback for server OS that doesn't match specific roles)
+let GenericServers =
+    BaselineDevices
+    | where IsServerOS
+    | project DeviceId, DeviceName
+    | join kind=leftanti (
+        union Tier0, Tier1, Tier2
+        | project DeviceId
+    ) on DeviceId
+    | extend
+        Tier = 2, Category = "Generic Server",
+        Confidence = "Low",
+        Evidence = "Server OS detected but no specific role identified",
+        DetectionMethod = "OSBased";
+
 let Tier3 = union AdminWorkstations, DeveloperWorkstations, SecurityAnalystWorkstations,
-                  SharedDevices, StandardWorkstations;
+                  SharedDevices, StandardWorkstations, GenericServers;
 
 // ============================================================================
 // FINAL OUTPUT - Combine all tiers with priority

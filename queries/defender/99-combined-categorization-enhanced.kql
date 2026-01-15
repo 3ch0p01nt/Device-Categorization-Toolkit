@@ -168,7 +168,7 @@ let DCsByMDI =
 // Combine all DC detection methods
 let DomainControllers =
     union DCsByDeviceType, DCsByKerberos, DCsByPortSignature, DCsByMDI
-    | summarize Methods = make_set(Method) by DeviceId, DeviceName
+    | summarize Methods = make_set(Method), MethodCount = dcount(Method) by DeviceId, DeviceName
     | extend
         Tier = 0,
         Category = "Domain Controller",
@@ -178,7 +178,12 @@ let DomainControllers =
             set_has_element(Methods, "DeviceType"), "High",  // DeviceType is authoritative
             "Medium"
         ),
-        Evidence = strcat("Detection methods: ", tostring(Methods)),
+        Evidence = strcat("DC confirmed by ", MethodCount, " signal(s): ",
+            iff(set_has_element(Methods, "DeviceType"), "DeviceType=DC, ", ""),
+            iff(set_has_element(Methods, "Kerberos-FourToSixMapping"), "Kerberos/88+IPv6, ", ""),
+            iff(tostring(Methods) has "Ports:", strcat("Listening on DC ports, "), ""),
+            iff(set_has_element(Methods, "MDI-IdentityEvents"), "MDI identity events, ", ""),
+            "Methods: ", tostring(Methods)),
         DetectionMethod = "MultiSignal";
 
 // Certificate Authorities - Enhanced with software + process detection
@@ -346,7 +351,9 @@ let FileServers =
     | summarize
         SMBConnections = count(),
         UniqueClients = dcount(RemoteIP),
-        SampleClients = make_set(RemoteIP, 5)
+        SampleClients = make_set(RemoteIP, 5),
+        FirstSeen = min(Timestamp),
+        LastSeen = max(Timestamp)
         by DeviceId, DeviceName
     | where SMBConnections > 100 and UniqueClients > 5
     | join kind=leftanti (DomainControllers | project DeviceId) on DeviceId
@@ -359,7 +366,9 @@ let FileServers =
             UniqueClients > 20, "Medium",
             "Low"
         ),
-        Evidence = strcat("SMB: ", SMBConnections, " connections from ", UniqueClients, " clients"),
+        Evidence = strcat("File sharing: ", SMBConnections, " SMB connections from ", UniqueClients, " unique clients. ",
+            "Activity period: ", format_datetime(FirstSeen, 'yyyy-MM-dd'), " to ", format_datetime(LastSeen, 'yyyy-MM-dd'), ". ",
+            "Sample clients: ", tostring(SampleClients)),
         DetectionMethod = "NetworkBehavior";
 
 // Database Servers (MySQL, PostgreSQL, Oracle) - Port + Process based
@@ -552,13 +561,26 @@ let AdminWorkstations =
             "Get-AD", "Set-AD", "New-AD", "Remove-AD", "Import-Module ActiveDirectory",
             "Get-GPO", "Get-DNS", "Get-DHCP", "Get-Exchange"
         ))
-    | summarize AdminToolCount = count(), Tools = make_set(FileName) by DeviceId, DeviceName
+    | summarize
+        AdminToolCount = count(),
+        Tools = make_set(FileName),
+        UniqueTools = dcount(FileName),
+        HasADTools = countif(FileName in~ ("dsa.msc", "dssite.msc", "dsac.exe", "ldp.exe")) > 0,
+        HasDNS = countif(FileName =~ "dnsmgmt.msc") > 0,
+        HasGPO = countif(FileName =~ "gpmc.msc") > 0,
+        HasRemoteTools = countif(FileName in~ ("mstsc.exe", "PsExec.exe", "PsExec64.exe", "msra.exe")) > 0
+        by DeviceId, DeviceName
     | where AdminToolCount > 20
     | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId
     | extend
         Tier = 3, Category = "IT Admin Workstation",
         Confidence = iff(AdminToolCount > 100, "High", "Medium"),
-        Evidence = strcat("Admin tools: ", AdminToolCount, " events, Tools: ", tostring(Tools)),
+        Evidence = strcat("Admin activity: ", AdminToolCount, " events across ", UniqueTools, " tools. ",
+            iff(HasADTools, "AD Admin, ", ""),
+            iff(HasDNS, "DNS Admin, ", ""),
+            iff(HasGPO, "GPO Admin, ", ""),
+            iff(HasRemoteTools, "Remote Admin, ", ""),
+            "Tools: ", tostring(Tools)),
         DetectionMethod = "ToolUsage";
 
 // Developer Workstations - Enhanced with more dev tools
@@ -583,13 +605,34 @@ let DeveloperWorkstations =
         // Version Control
         "git.exe", "git-bash.exe", "svn.exe", "gh.exe"
     )
-    | summarize DevToolCount = count(), Tools = make_set(FileName) by DeviceId, DeviceName
+    | summarize
+        DevToolCount = count(),
+        Tools = make_set(FileName),
+        UniqueTools = dcount(FileName),
+        HasIDE = countif(FileName in~ ("devenv.exe", "Code.exe", "rider64.exe", "idea64.exe", "pycharm64.exe", "eclipse.exe")) > 0,
+        HasDocker = countif(FileName in~ ("docker.exe", "docker-compose.exe")) > 0,
+        HasK8s = countif(FileName in~ ("kubectl.exe", "helm.exe")) > 0,
+        HasCloud = countif(FileName in~ ("az.cmd", "aws.exe", "gcloud.exe", "terraform.exe")) > 0,
+        HasGit = countif(FileName in~ ("git.exe", "git-bash.exe", "gh.exe")) > 0,
+        HasNode = countif(FileName in~ ("node.exe", "npm.exe", "npm.cmd", "yarn.exe")) > 0,
+        HasPython = countif(FileName in~ ("python.exe", "python3.exe", "pip.exe")) > 0,
+        HasDotNet = countif(FileName in~ ("dotnet.exe", "msbuild.exe", "csc.exe")) > 0
+        by DeviceId, DeviceName
     | where DevToolCount > 50
     | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId
     | extend
         Tier = 3, Category = "Developer Workstation",
         Confidence = iff(DevToolCount > 500, "High", "Medium"),
-        Evidence = strcat("Dev tools: ", DevToolCount, " events, Tools: ", tostring(Tools)),
+        Evidence = strcat("Dev activity: ", DevToolCount, " events across ", UniqueTools, " tools. Stack: ",
+            iff(HasIDE, "IDE, ", ""),
+            iff(HasDotNet, ".NET, ", ""),
+            iff(HasNode, "Node.js, ", ""),
+            iff(HasPython, "Python, ", ""),
+            iff(HasDocker, "Docker, ", ""),
+            iff(HasK8s, "Kubernetes, ", ""),
+            iff(HasCloud, "Cloud CLI, ", ""),
+            iff(HasGit, "Git, ", ""),
+            "Tools: ", tostring(Tools)),
         DetectionMethod = "ToolUsage";
 
 // Security Analyst Workstations - NEW category
@@ -620,15 +663,22 @@ let SharedDevices =
     | where AccountName !in~ ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "DWM-1", "UMFD-0")
     | summarize
         UniqueUsers = dcount(AccountName),
-        Logons = count(),
-        Users = make_set(AccountName, 10)
+        TotalLogons = count(),
+        InteractiveLogons = countif(LogonType == "Interactive"),
+        RemoteLogons = countif(LogonType == "RemoteInteractive"),
+        Users = make_set(AccountName, 10),
+        FirstLogon = min(Timestamp),
+        LastLogon = max(Timestamp)
         by DeviceId, DeviceName
     | where UniqueUsers >= 5
     | join kind=inner (BaselineDevices | where not(IsServerOS) | project DeviceId) on DeviceId
     | extend
         Tier = 3, Category = "Kiosk / Shared Device",
         Confidence = iff(UniqueUsers >= 15, "High", "Medium"),
-        Evidence = strcat("Unique users: ", UniqueUsers, ", Sample: ", tostring(Users)),
+        Evidence = strcat("Multi-user device: ", UniqueUsers, " unique users, ", TotalLogons, " total logons. ",
+            "Interactive: ", InteractiveLogons, ", Remote: ", RemoteLogons, ". ",
+            "Period: ", format_datetime(FirstLogon, 'yyyy-MM-dd'), " to ", format_datetime(LastLogon, 'yyyy-MM-dd'), ". ",
+            "Users: ", tostring(Users)),
         DetectionMethod = "LogonBehavior";
 
 // Standard Workstations (default for non-server OS)
@@ -670,30 +720,53 @@ let Tier3 = union AdminWorkstations, DeveloperWorkstations, SecurityAnalystWorks
                   SharedDevices, StandardWorkstations, GenericServers;
 
 // ============================================================================
-// FINAL OUTPUT - Combine all tiers with priority
+// FINAL OUTPUT - Combine all tiers with comprehensive evidence
 // ============================================================================
 let AllCategorized = union Tier0, Tier1, Tier2, Tier3;
 
+// Aggregate ALL categories and evidence for each device
+let AggregatedCategories =
+    AllCategorized
+    | summarize
+        MinTier = min(Tier),
+        AllCategories = make_set(Category),
+        AllTiers = make_set(Tier),
+        AllEvidence = make_set(Evidence),
+        AllMethods = make_set(DetectionMethod),
+        HighestConfidence = iff(countif(Confidence == "High") > 0, "High",
+                            iff(countif(Confidence == "Medium") > 0, "Medium", "Low"))
+        by DeviceId, DeviceName;
+
 let FinalOutput =
     BaselineDevices
-    | join kind=leftouter (
-        AllCategorized
-        | summarize
-            arg_min(Tier, Category, Confidence, Evidence, DetectionMethod),
-            AllCategories = make_set(Category)
-            by DeviceId, DeviceName
-    ) on DeviceId, DeviceName
+    | join kind=leftouter (AggregatedCategories) on DeviceId, DeviceName
     | extend
-        // Smart defaults based on OS type - no device should be "Uncategorized"
-        Tier = coalesce(Tier, iff(IsServerOS == true, 2, 3)),
-        Category = coalesce(Category, iff(IsServerOS == true, "Generic Server", "Standard Workstation")),
+        // Primary category is the one with lowest tier
+        Tier = coalesce(MinTier, iff(IsServerOS == true, 2, 3)),
+        // Get primary category (first in the set after sorting by tier)
+        Category = coalesce(
+            iff(array_length(AllCategories) > 0, tostring(AllCategories[0]), ""),
+            iff(IsServerOS == true, "Generic Server", "Standard Workstation")
+        ),
+        // Secondary categories (all others)
         SecondaryCategory = iff(array_length(AllCategories) > 1,
             strcat_array(array_slice(AllCategories, 1, array_length(AllCategories)), ", "), ""),
-        Confidence = coalesce(Confidence, "Low"),
-        Evidence = coalesce(Evidence, iff(IsServerOS == true,
-            "Server OS detected but no specific role identified",
-            "Default: No specialized classification signals")),
-        DetectionMethod = coalesce(DetectionMethod, "Default");
+        // Count of roles detected
+        RoleCount = iff(array_length(AllCategories) > 0, array_length(AllCategories), 1),
+        // Confidence based on signal strength
+        Confidence = coalesce(HighestConfidence, "Low"),
+        // Combine ALL evidence from all detections
+        Evidence = coalesce(
+            strcat_array(AllEvidence, " | "),
+            iff(IsServerOS == true,
+                "Server OS detected but no specific role identified",
+                "Default: No specialized classification signals")
+        ),
+        // All detection methods used
+        DetectionMethod = coalesce(
+            strcat_array(AllMethods, ", "),
+            "Default"
+        );
 
 // Output for export
 FinalOutput
@@ -703,6 +776,7 @@ FinalOutput
     Tier,
     Category,
     SecondaryCategory,
+    RoleCount,
     Confidence,
     DetectionMethod,
     Evidence,
@@ -717,4 +791,4 @@ FinalOutput
     LastSeen,
     IsAzureADJoined,
     JoinType
-| order by Tier asc, Category asc, DeviceName asc
+| order by Tier asc, RoleCount desc, Category asc, DeviceName asc

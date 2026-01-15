@@ -330,7 +330,7 @@ let AllWithFallback = union AllCategorized, (BaselineDevices | join kind=leftant
 AllWithFallback
 | summarize arg_min(Tier, Category, Confidence, Evidence, DetectionMethod), AllCategories = make_set(Category) by DeviceId, DeviceName
 | join kind=leftouter (BaselineDevices | project DeviceId, DeviceName, OSPlatform, OSVersion, NativeDeviceType, MachineGroup, LastSeen, IsAzureADJoined, JoinType) on DeviceId, DeviceName
-| extend OtherRoles = set_difference(AllCategories, pack_array(Category)), AdditionalRoles = iff(array_length(set_difference(AllCategories, pack_array(Category))) > 0, strcat_array(set_difference(AllCategories, pack_array(Category)), ", "), ""), RoleCount = array_length(AllCategories)
+| extend AdditionalRoles = iff(array_length(set_difference(AllCategories, pack_array(Category))) > 0, strcat_array(set_difference(AllCategories, pack_array(Category)), ", "), ""), RoleCount = array_length(AllCategories)
 | project DeviceName, DeviceId, Tier, Category, AdditionalRoles, RoleCount, Confidence, DetectionMethod, Evidence, NativeDeviceType, OSPlatform, OSVersion, MachineGroup, LastSeen, IsAzureADJoined, JoinType
 "@
 

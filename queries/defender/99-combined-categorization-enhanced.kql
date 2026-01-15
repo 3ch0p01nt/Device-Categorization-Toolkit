@@ -175,15 +175,16 @@ let DomainControllers =
         Confidence = case(
             array_length(Methods) >= 3, "High",
             array_length(Methods) == 2, "High",
-            set_has_element(Methods, "DeviceType"), "High",  // DeviceType is authoritative
+            set_has_element(Methods, "DeviceType"), "High",
             "Medium"
         ),
-        Evidence = strcat("DC confirmed by ", MethodCount, " signal(s): ",
-            iff(set_has_element(Methods, "DeviceType"), "DeviceType=DC, ", ""),
-            iff(set_has_element(Methods, "Kerberos-FourToSixMapping"), "Kerberos/88+IPv6, ", ""),
-            iff(tostring(Methods) has "Ports:", strcat("Listening on DC ports, "), ""),
-            iff(set_has_element(Methods, "MDI-IdentityEvents"), "MDI identity events, ", ""),
-            "Methods: ", tostring(Methods)),
+        Evidence = strcat(
+            iff(set_has_element(Methods, "DeviceType"), "Defender identifies this device as a Domain Controller. ", ""),
+            iff(set_has_element(Methods, "Kerberos-FourToSixMapping"), "Serves Kerberos authentication on port 88 (the protocol DCs use to authenticate users). ", ""),
+            iff(tostring(Methods) has "Ports:", "Listens on LDAP/DNS ports used exclusively by DCs to serve directory queries. ", ""),
+            iff(set_has_element(Methods, "MDI-IdentityEvents"), "Processes Active Directory authentication events (captured by MDI). ", ""),
+            "(", MethodCount, " detection methods)"
+        ),
         DetectionMethod = "MultiSignal";
 
 // Certificate Authorities - Enhanced with software + process detection
@@ -191,7 +192,7 @@ let CAsBySoftware =
     DeviceTvmSoftwareInventory
     | where SoftwareName has_any ("active_directory_certificate_services", "adcs", "certsvc")
     | summarize Software = make_set(SoftwareName) by DeviceId, DeviceName
-    | extend Method = strcat("Software: ", tostring(Software));
+    | extend Method = "HasADCS";
 
 let CAsByProcess =
     DeviceProcessEvents
@@ -199,7 +200,7 @@ let CAsByProcess =
     | where FileName =~ "certsvc.exe"
     | summarize ProcessCount = count() by DeviceId, DeviceName
     | where ProcessCount > 5
-    | extend Method = strcat("Process: certsvc.exe (", ProcessCount, " events)");
+    | extend Method = "RunsCertsvc";
 
 let CertificateAuthorities =
     union CAsBySoftware, CAsByProcess
@@ -208,7 +209,11 @@ let CertificateAuthorities =
         Tier = 0,
         Category = "Certificate Authority",
         Confidence = iff(array_length(Methods) > 1, "High", "Medium"),
-        Evidence = strcat("CA confirmed by ", MethodCount, " signal(s): ", strcat_array(Methods, " | ")),
+        Evidence = strcat(
+            iff(set_has_element(Methods, "HasADCS"), "Has AD Certificate Services installed (the software that issues PKI certificates). ", ""),
+            iff(set_has_element(Methods, "RunsCertsvc"), "Runs certsvc.exe (the Certificate Services process that signs and issues certificates). ", ""),
+            "This device issues digital certificates for the organization."
+        ),
         DetectionMethod = "MultiSignal";
 
 // AD FS Servers - Enhanced
@@ -218,7 +223,7 @@ let ADFSByProcess =
     | where FileName in~ ("Microsoft.IdentityServer.ServiceHost.exe", "AdfsSrv.exe")
     | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
     | where ProcessCount > 10
-    | extend Method = strcat("ADFS processes: ", tostring(Processes), " (", ProcessCount, " events)");
+    | extend Method = "RunsADFS";
 
 let ADFSByPort =
     DeviceNetworkEvents
@@ -227,17 +232,21 @@ let ADFSByPort =
     | where LocalPort in (443, 49443)  // ADFS ports
     | summarize Ports = make_set(LocalPort), ConnectionCount = count() by DeviceId, DeviceName
     | where set_has_element(Ports, 443)
-    | extend Method = strcat("ADFS ports listening: ", tostring(Ports));
+    | extend Method = "ListensADFSPorts";
 
 let ADFSServers =
     union ADFSByProcess, ADFSByPort
     | summarize Methods = make_set(Method), MethodCount = dcount(Method) by DeviceId, DeviceName
-    | where tostring(Methods) has_any ("ADFS processes", "Microsoft.IdentityServer")  // Must have process evidence
+    | where set_has_element(Methods, "RunsADFS")  // Must have process evidence
     | extend
         Tier = 0,
         Category = "AD FS Server",
         Confidence = iff(array_length(Methods) > 1, "High", "Medium"),
-        Evidence = strcat("AD FS confirmed by ", MethodCount, " signal(s): ", strcat_array(Methods, " | ")),
+        Evidence = strcat(
+            "Runs AD FS federation service (Microsoft.IdentityServer.ServiceHost.exe), which provides single sign-on and federated authentication. ",
+            iff(set_has_element(Methods, "ListensADFSPorts"), "Accepts federation requests on HTTPS. ", ""),
+            "This device handles federated identity authentication for the organization."
+        ),
         DetectionMethod = "MultiSignal";
 
 // Entra Connect Servers - Enhanced
@@ -252,7 +261,10 @@ let EntraConnectServers =
         Tier = 0,
         Category = "Entra Connect Server",
         Confidence = "High",
-        Evidence = strcat("Entra Connect/AAD Sync: ", tostring(Processes), " (", ProcessCount, " events). Identity sync infrastructure detected."),
+        Evidence = strcat(
+            "Runs Entra Connect sync engine (", tostring(Processes), "), which synchronizes on-premises Active Directory identities to Microsoft Entra ID (Azure AD). ",
+            "This device bridges on-prem AD with cloud identity - compromise could allow cloud tenant takeover."
+        ),
         DetectionMethod = "ProcessBased";
 
 let Tier0 = union DomainControllers, CertificateAuthorities, ADFSServers, EntraConnectServers;
@@ -271,7 +283,11 @@ let SQLServersByProcess =
     | extend
         Tier = 1, Category = "SQL Server",
         Confidence = iff(ProcessCount > 200, "High", "Medium"),
-        Evidence = strcat("SQL processes: ", tostring(Processes), " (", ProcessCount, " events)"),
+        Evidence = strcat(
+            "Runs SQL Server database engine (sqlservr.exe) which hosts organizational databases. ",
+            iff(tostring(Processes) has "sqlagent", "SQL Agent handles scheduled jobs and maintenance. ", ""),
+            "This device stores and serves database queries - likely contains business-critical data."
+        ),
         DetectionMethod = "ProcessBased";
 
 let SQLServers = union SQLServersBySoftware, SQLServersByProcess
@@ -288,7 +304,10 @@ let ExchangeServersByProcess =
     | extend
         Tier = 1, Category = "Exchange Server",
         Confidence = iff(ProcessCount > 500, "High", "Medium"),
-        Evidence = strcat("Exchange processes: ", tostring(Processes)),
+        Evidence = strcat(
+            "Runs Microsoft Exchange mail services (", tostring(Processes), "). ",
+            "This device processes organizational email - contains sensitive communications and is a high-value target."
+        ),
         DetectionMethod = "ProcessBased";
 
 let ExchangeServers = union ExchangeServersBySoftware, ExchangeServersByProcess
@@ -305,7 +324,10 @@ let SharePointServersByProcess =
     | extend
         Tier = 1, Category = "SharePoint Server",
         Confidence = iff(ProcessCount > 200, "High", "Medium"),
-        Evidence = strcat("SharePoint processes: ", tostring(Processes)),
+        Evidence = strcat(
+            "Runs SharePoint services (", tostring(Processes), "). ",
+            "This device hosts document libraries and collaboration sites - contains organizational documents and files."
+        ),
         DetectionMethod = "ProcessBased";
 
 let SharePointServers = union SharePointServersBySoftware, SharePointServersByProcess
@@ -366,9 +388,11 @@ let FileServers =
             UniqueClients > 20, "Medium",
             "Low"
         ),
-        Evidence = strcat("File sharing: ", SMBConnections, " SMB connections from ", UniqueClients, " unique clients. ",
-            "Activity period: ", format_datetime(FirstSeen, 'yyyy-MM-dd'), " to ", format_datetime(LastSeen, 'yyyy-MM-dd'), ". ",
-            "Sample clients: ", tostring(SampleClients)),
+        Evidence = strcat(
+            "Received ", SMBConnections, " file sharing connections from ", UniqueClients, " different computers via SMB (port 445). ",
+            "Multiple clients accessing this device for files indicates it serves as a central file storage location. ",
+            "This device likely contains shared documents, department files, or user home directories."
+        ),
         DetectionMethod = "NetworkBehavior";
 
 // Database Servers (MySQL, PostgreSQL, Oracle) - Port + Process based
@@ -575,12 +599,14 @@ let AdminWorkstations =
     | extend
         Tier = 3, Category = "IT Admin Workstation",
         Confidence = iff(AdminToolCount > 100, "High", "Medium"),
-        Evidence = strcat("Admin activity: ", AdminToolCount, " events across ", UniqueTools, " tools. ",
-            iff(HasADTools, "AD Admin, ", ""),
-            iff(HasDNS, "DNS Admin, ", ""),
-            iff(HasGPO, "GPO Admin, ", ""),
-            iff(HasRemoteTools, "Remote Admin, ", ""),
-            "Tools: ", tostring(Tools)),
+        Evidence = strcat(
+            "User runs administrative tools (", AdminToolCount, " events): ",
+            iff(HasADTools, "Active Directory management (creates/modifies user accounts), ", ""),
+            iff(HasDNS, "DNS management (controls name resolution), ", ""),
+            iff(HasGPO, "Group Policy management (controls security settings), ", ""),
+            iff(HasRemoteTools, "Remote administration tools (PsExec, RDP), ", ""),
+            "This workstation is used by IT staff to manage infrastructure - may have elevated privileges."
+        ),
         DetectionMethod = "ToolUsage";
 
 // Developer Workstations - Enhanced with more dev tools
@@ -623,16 +649,18 @@ let DeveloperWorkstations =
     | extend
         Tier = 3, Category = "Developer Workstation",
         Confidence = iff(DevToolCount > 500, "High", "Medium"),
-        Evidence = strcat("Dev activity: ", DevToolCount, " events across ", UniqueTools, " tools. Stack: ",
-            iff(HasIDE, "IDE, ", ""),
-            iff(HasDotNet, ".NET, ", ""),
-            iff(HasNode, "Node.js, ", ""),
-            iff(HasPython, "Python, ", ""),
-            iff(HasDocker, "Docker, ", ""),
-            iff(HasK8s, "Kubernetes, ", ""),
-            iff(HasCloud, "Cloud CLI, ", ""),
-            iff(HasGit, "Git, ", ""),
-            "Tools: ", tostring(Tools)),
+        Evidence = strcat(
+            "User runs software development tools (", DevToolCount, " events): ",
+            iff(HasIDE, "Code editors/IDEs (writes software), ", ""),
+            iff(HasGit, "Git version control (accesses source code repos), ", ""),
+            iff(HasDotNet, ".NET development, ", ""),
+            iff(HasNode, "Node.js/JavaScript development, ", ""),
+            iff(HasPython, "Python development, ", ""),
+            iff(HasDocker, "Docker containers (builds/runs containerized apps), ", ""),
+            iff(HasK8s, "Kubernetes (deploys to container orchestration), ", ""),
+            iff(HasCloud, "Cloud CLI tools (AWS/Azure/GCP access), ", ""),
+            "This workstation has access to source code and deployment pipelines."
+        ),
         DetectionMethod = "ToolUsage";
 
 // Security Analyst Workstations - NEW category
@@ -652,7 +680,14 @@ let SecurityAnalystWorkstations =
     | extend
         Tier = 3, Category = "Security Analyst Workstation",
         Confidence = iff(SecToolCount > 50, "High", "Medium"),
-        Evidence = strcat("Security tools: ", tostring(Tools)),
+        Evidence = strcat(
+            "User runs security analysis tools (", tostring(Tools), "): ",
+            iff(tostring(Tools) has_any ("Wireshark", "tshark", "Fiddler"), "Network traffic analysis, ", ""),
+            iff(tostring(Tools) has_any ("procmon", "procexp", "autoruns"), "System forensics (Sysinternals), ", ""),
+            iff(tostring(Tools) has_any ("IDA64", "ghidra", "x64dbg"), "Malware analysis/reverse engineering, ", ""),
+            iff(tostring(Tools) has_any ("nmap", "masscan", "burpsuite"), "Penetration testing, ", ""),
+            "This workstation is used for security operations - user likely has security team privileges."
+        ),
         DetectionMethod = "ToolUsage";
 
 // Kiosk / Shared Devices
@@ -675,10 +710,11 @@ let SharedDevices =
     | extend
         Tier = 3, Category = "Kiosk / Shared Device",
         Confidence = iff(UniqueUsers >= 15, "High", "Medium"),
-        Evidence = strcat("Multi-user device: ", UniqueUsers, " unique users, ", TotalLogons, " total logons. ",
-            "Interactive: ", InteractiveLogons, ", Remote: ", RemoteLogons, ". ",
-            "Period: ", format_datetime(FirstLogon, 'yyyy-MM-dd'), " to ", format_datetime(LastLogon, 'yyyy-MM-dd'), ". ",
-            "Users: ", tostring(Users)),
+        Evidence = strcat(
+            UniqueUsers, " different users have logged into this device (vs typical 1-2 for personal workstations). ",
+            "This indicates a shared computer such as a conference room PC, training lab station, or public kiosk. ",
+            "Sample users: ", tostring(Users)
+        ),
         DetectionMethod = "LogonBehavior";
 
 // Standard Workstations (default for non-server OS)

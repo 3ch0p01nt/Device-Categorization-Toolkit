@@ -1,8 +1,3 @@
-// Device Categorization - API-Friendly Version
-// This query is optimized for use with Microsoft Graph API
-// Works without DeviceTvmSoftwareInventory or IdentityDirectoryEvents
-// Single statement, no multi-line strings
-
 let LookbackDays = 30;
 let BaselineDevices = DeviceInfo | where Timestamp > ago(LookbackDays * 1d) | summarize LastSeen = max(Timestamp), arg_max(Timestamp, OSPlatform, OSVersion, OSArchitecture, DeviceType, MachineGroup, IsAzureADJoined, JoinType) by DeviceId, DeviceName | extend IsServerOS = OSPlatform has_any ("Server", "WindowsServer") or OSVersion has_any ("Server", "2016", "2019", "2022", "2012"), NativeDeviceType = DeviceType;
 let DCsByDeviceType = DeviceInfo | where Timestamp > ago(LookbackDays * 1d) | where DeviceType == "DomainController" | distinct DeviceId, DeviceName | extend Method = "DeviceType";

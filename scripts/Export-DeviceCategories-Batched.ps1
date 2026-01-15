@@ -25,9 +25,19 @@
 .PARAMETER BatchMode
     How to split the queries: 'Prefix' (by device name A-Z) or 'Tier' (by tier 0-3)
 
+.PARAMETER CloudEnvironment
+    The Microsoft cloud environment: 'Commercial', 'GCCHigh', or 'DoD'
+    - Commercial: graph.microsoft.com (default)
+    - GCCHigh: graph.microsoft.us
+    - DoD: dod-graph.microsoft.us
+
 .EXAMPLE
-    # Interactive auth
+    # Interactive auth - Commercial cloud
     .\Export-DeviceCategories-Batched.ps1 -TenantId "your-tenant-id"
+
+.EXAMPLE
+    # Interactive auth - GCC High
+    .\Export-DeviceCategories-Batched.ps1 -TenantId "your-tenant-id" -CloudEnvironment GCCHigh
 
 .EXAMPLE
     # App auth (for automation)
@@ -56,16 +66,40 @@ param(
 
     [Parameter(Mandatory = $false)]
     [ValidateSet('Prefix', 'Tier')]
-    [string]$BatchMode = 'Prefix'
+    [string]$BatchMode = 'Prefix',
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('Commercial', 'GCCHigh', 'DoD')]
+    [string]$CloudEnvironment = 'Commercial'
 )
 
 $ErrorActionPreference = "Stop"
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION - Set endpoints based on cloud environment
 # ============================================================================
 
-$GraphBaseUrl = "https://graph.microsoft.com/v1.0"
+switch ($CloudEnvironment) {
+    'Commercial' {
+        $GraphBaseUrl = "https://graph.microsoft.com/v1.0"
+        $LoginBaseUrl = "https://login.microsoftonline.com"
+        $GraphScope = "https://graph.microsoft.com/.default"
+        $GraphScopeInteractive = "https://graph.microsoft.com/ThreatHunting.Read.All"
+    }
+    'GCCHigh' {
+        $GraphBaseUrl = "https://graph.microsoft.us/v1.0"
+        $LoginBaseUrl = "https://login.microsoftonline.us"
+        $GraphScope = "https://graph.microsoft.us/.default"
+        $GraphScopeInteractive = "https://graph.microsoft.us/ThreatHunting.Read.All"
+    }
+    'DoD' {
+        $GraphBaseUrl = "https://dod-graph.microsoft.us/v1.0"
+        $LoginBaseUrl = "https://login.microsoftonline.us"
+        $GraphScope = "https://dod-graph.microsoft.us/.default"
+        $GraphScopeInteractive = "https://dod-graph.microsoft.us/ThreatHunting.Read.All"
+    }
+}
+
 $HuntingEndpoint = "$GraphBaseUrl/security/runHuntingQuery"
 
 # Device name prefixes for batching (covers A-Z, 0-9, and other)
@@ -86,7 +120,10 @@ function Get-AccessToken {
     param(
         [string]$TenantId,
         [string]$ClientId,
-        [string]$ClientSecret
+        [string]$ClientSecret,
+        [string]$LoginUrl,
+        [string]$Scope,
+        [string]$ScopeInteractive
     )
 
     if ($ClientId -and $ClientSecret) {
@@ -97,10 +134,10 @@ function Get-AccessToken {
             grant_type    = "client_credentials"
             client_id     = $ClientId
             client_secret = $ClientSecret
-            scope         = "https://graph.microsoft.com/.default"
+            scope         = $Scope
         }
 
-        $tokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+        $tokenUrl = "$LoginUrl/$TenantId/oauth2/v2.0/token"
         $response = Invoke-RestMethod -Uri $tokenUrl -Method POST -Body $body -ContentType "application/x-www-form-urlencoded"
         return $response.access_token
     }
@@ -108,10 +145,17 @@ function Get-AccessToken {
         # Interactive device code authentication
         Write-Host "Authenticating with device code flow..." -ForegroundColor Yellow
 
-        $deviceCodeUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/devicecode"
+        # Use appropriate client ID for gov cloud
+        $appClientId = if ($LoginUrl -like "*microsoftonline.us*") {
+            "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # May need gov-specific app ID
+        } else {
+            "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # Microsoft Graph PowerShell
+        }
+
+        $deviceCodeUrl = "$LoginUrl/$TenantId/oauth2/v2.0/devicecode"
         $body = @{
-            client_id = "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # Microsoft Graph PowerShell
-            scope     = "https://graph.microsoft.com/ThreatHunting.Read.All"
+            client_id = $appClientId
+            scope     = $ScopeInteractive
         }
 
         $deviceCode = Invoke-RestMethod -Uri $deviceCodeUrl -Method POST -Body $body
@@ -121,10 +165,10 @@ function Get-AccessToken {
         Write-Host ""
 
         # Poll for token
-        $tokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+        $tokenUrl = "$LoginUrl/$TenantId/oauth2/v2.0/token"
         $tokenBody = @{
             grant_type  = "urn:ietf:params:oauth:grant-type:device_code"
-            client_id   = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+            client_id   = $appClientId
             device_code = $deviceCode.device_code
         }
 
@@ -247,6 +291,8 @@ Write-Host "  Device Categorization Export (Batched)    " -ForegroundColor Cyan
 Write-Host "=============================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Tenant ID:    $TenantId" -ForegroundColor White
+Write-Host "Cloud:        $CloudEnvironment" -ForegroundColor White
+Write-Host "Graph URL:    $GraphBaseUrl" -ForegroundColor Gray
 Write-Host "Lookback:     $LookbackDays days" -ForegroundColor White
 Write-Host "Batch Mode:   $BatchMode" -ForegroundColor White
 Write-Host ""
@@ -257,7 +303,7 @@ if (-not (Test-Path $OutputPath)) {
 }
 
 # Get access token
-$AccessToken = Get-AccessToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
+$AccessToken = Get-AccessToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -LoginUrl $LoginBaseUrl -Scope $GraphScope -ScopeInteractive $GraphScopeInteractive
 
 # Collect all results
 $AllResults = @()

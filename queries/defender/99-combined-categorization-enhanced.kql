@@ -171,7 +171,7 @@ let DomainControllers =
         Confidence = case(
             array_length(Methods) >= 3, "High",
             array_length(Methods) == 2, "High",
-            Methods has "DeviceType", "High",  // DeviceType is authoritative
+            set_has_element(Methods, "DeviceType"), "High",  // DeviceType is authoritative
             "Medium"
         ),
         Evidence = strcat("Detection methods: ", tostring(Methods)),
@@ -217,13 +217,13 @@ let ADFSByPort =
     | where ActionType == "ListeningConnectionCreated"
     | where LocalPort in (443, 49443)  // ADFS ports
     | summarize Ports = make_set(LocalPort) by DeviceId, DeviceName
-    | where Ports has 443
+    | where set_has_element(Ports, 443)
     | extend Method = "ADFSPorts";
 
 let ADFSServers =
     union ADFSByProcess, ADFSByPort
     | summarize Methods = make_set(Method) by DeviceId, DeviceName
-    | where Methods has_any ("Processes", "Microsoft.IdentityServer")  // Must have process evidence
+    | where tostring(Methods) has_any ("Processes", "Microsoft.IdentityServer")  // Must have process evidence
     | extend
         Tier = 0,
         Category = "AD FS Server",

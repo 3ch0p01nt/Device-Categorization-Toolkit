@@ -628,13 +628,18 @@ let SharedDevices =
         DetectionMethod = "LogonBehavior";
 
 // Standard Workstations (default)
+// IMPORTANT: Exclude ALL higher-tier devices to prevent dual categorization
 let StandardWorkstations =
     BaselineDevices
     | where not(IsServerOS)
     | where DeviceType in ("Workstation", "") or isempty(DeviceType)
     | project DeviceId, DeviceName
     | join kind=leftanti (
-        union AdminWorkstations, DeveloperWorkstations, SecurityAnalystWorkstations, SharedDevices
+        union
+            // Exclude other Tier 3 specialized workstations
+            AdminWorkstations, DeveloperWorkstations, SecurityAnalystWorkstations, SharedDevices,
+            // Exclude Tier 0, 1, 2 devices (servers/infrastructure)
+            Tier0, Tier1, Tier2
         | project DeviceId
     ) on DeviceId
     | extend

@@ -163,7 +163,14 @@ function Get-AccessToken {
         $deviceCode = Invoke-RestMethod -Uri $deviceCodeUrl -Method POST -Body $body
 
         Write-Host ""
-        Write-Host $deviceCode.message -ForegroundColor Cyan
+        # For gov clouds, override the URL in the message to use the correct portal
+        if ($LoginUrl -like "*microsoftonline.us*") {
+            Write-Host "To sign in, use a web browser to open the page:" -ForegroundColor Cyan
+            Write-Host "  https://login.microsoftonline.us/common/oauth2/deviceauth" -ForegroundColor Yellow
+            Write-Host "and enter the code $($deviceCode.user_code) to authenticate." -ForegroundColor Cyan
+        } else {
+            Write-Host $deviceCode.message -ForegroundColor Cyan
+        }
         Write-Host ""
 
         # Poll for token

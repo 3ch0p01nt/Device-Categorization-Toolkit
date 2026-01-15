@@ -26,8 +26,12 @@ let BaselineDevices =
                 AssetValue, ExposureLevel, IsInternetFacing)
         by DeviceId, DeviceName
     | extend
-        IsServerOS = OSPlatform has_any ("Server", "WindowsServer")
+        // Explicitly handle nulls - default to false if OS info is missing
+        IsServerOS = coalesce(
+            OSPlatform has_any ("Server", "WindowsServer")
             or OSVersion has_any ("Server", "2016", "2019", "2022", "2012"),
+            false
+        ),
         // Use native DeviceType when available
         NativeDeviceType = DeviceType;
 
@@ -680,13 +684,16 @@ let FinalOutput =
             by DeviceId, DeviceName
     ) on DeviceId, DeviceName
     | extend
-        Tier = coalesce(Tier, 99),
-        Category = coalesce(Category, "Uncategorized"),
+        // Smart defaults based on OS type - no device should be "Uncategorized"
+        Tier = coalesce(Tier, iff(IsServerOS == true, 2, 3)),
+        Category = coalesce(Category, iff(IsServerOS == true, "Generic Server", "Standard Workstation")),
         SecondaryCategory = iff(array_length(AllCategories) > 1,
             strcat_array(array_slice(AllCategories, 1, array_length(AllCategories)), ", "), ""),
         Confidence = coalesce(Confidence, "Low"),
-        Evidence = coalesce(Evidence, "No classification signals detected"),
-        DetectionMethod = coalesce(DetectionMethod, "None");
+        Evidence = coalesce(Evidence, iff(IsServerOS == true,
+            "Server OS detected but no specific role identified",
+            "Default: No specialized classification signals")),
+        DetectionMethod = coalesce(DetectionMethod, "Default");
 
 // Output for export
 FinalOutput

@@ -45,6 +45,36 @@
 
 .NOTES
     Requires ThreatHunting.Read.All permission
+
+    CATEGORY DEFINITIONS:
+
+    Tier 0 - Critical Identity Infrastructure (compromise = full domain compromise)
+      - Domain Controller: Hosts Active Directory, authenticates all domain users/computers
+      - Certificate Authority: Issues PKI certificates for authentication and encryption
+      - AD FS Server: Provides federated authentication (SSO) for cloud/external services
+      - Entra Connect Server: Syncs identities between on-prem AD and Entra ID (Azure AD)
+
+    Tier 1 - Business Critical Servers (hosts sensitive data or critical services)
+      - SQL Server: Database server running Microsoft SQL Server
+      - Exchange Server: On-premises email server
+      - SharePoint Server: On-premises collaboration/document management
+      - Web Server (IIS): Hosts web applications via IIS (not Exchange/SharePoint)
+      - File Server: High SMB traffic from multiple clients (shared file storage)
+      - Backup Server: Runs backup software (Veeam, DPM, Commvault, Acronis)
+
+    Tier 2 - Infrastructure Servers (supports IT operations)
+      - WSUS Server: Windows Server Update Services (patch management)
+      - SCCM Server: System Center Configuration Manager (endpoint management)
+      - Jump Box / PAW: High RDP inbound AND outbound (admin access point)
+
+    Tier 3 - Endpoints (user devices)
+      - IT Admin Workstation: Frequent use of admin tools (RSAT, mmc.exe, PsExec)
+      - Developer Workstation: Frequent use of dev tools (VS, VSCode, git, docker)
+      - Security Analyst Workstation: Frequent use of security tools (Wireshark, procmon)
+      - Kiosk / Shared Device: 5+ unique interactive user logons
+      - Standard Workstation: DEFAULT - no specialized signals detected; typical end-user
+        device running Office apps, browsers, etc. This is the fallback when a device
+        doesn't match any other category criteria.
 #>
 
 [CmdletBinding()]

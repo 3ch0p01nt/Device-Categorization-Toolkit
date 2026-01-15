@@ -72,9 +72,14 @@
       - Developer Workstation: Frequent use of dev tools (VS, VSCode, git, docker)
       - Security Analyst Workstation: Frequent use of security tools (Wireshark, procmon)
       - Kiosk / Shared Device: 5+ unique interactive user logons
-      - Standard Workstation: DEFAULT - no specialized signals detected; typical end-user
-        device running Office apps, browsers, etc. This is the fallback when a device
-        doesn't match any other category criteria.
+      - Standard Workstation: DEFAULT for NativeDeviceType="Workstation" with no signals
+      - AudioAndVideo Device: DEFAULT for NativeDeviceType="AudioAndVideo" (Teams Rooms, etc.)
+      - NetworkDevice Device: DEFAULT for NativeDeviceType="NetworkDevice"
+      - Unknown Device Type: DEFAULT when NativeDeviceType is empty or unknown
+
+    Tier 2 - Default for uncategorized servers
+      - General Purpose Server: DEFAULT for NativeDeviceType="Server" with no specific
+        role detected. These are Windows Servers without identified workloads.
 #>
 
 [CmdletBinding()]

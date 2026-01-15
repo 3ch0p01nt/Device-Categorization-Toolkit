@@ -190,8 +190,8 @@ let DomainControllers =
 let CAsBySoftware =
     DeviceTvmSoftwareInventory
     | where SoftwareName has_any ("active_directory_certificate_services", "adcs", "certsvc")
-    | distinct DeviceId, DeviceName
-    | extend Method = "SoftwareInventory";
+    | summarize Software = make_set(SoftwareName) by DeviceId, DeviceName
+    | extend Method = strcat("Software: ", tostring(Software));
 
 let CAsByProcess =
     DeviceProcessEvents
@@ -199,16 +199,16 @@ let CAsByProcess =
     | where FileName =~ "certsvc.exe"
     | summarize ProcessCount = count() by DeviceId, DeviceName
     | where ProcessCount > 5
-    | extend Method = strcat("certsvc.exe:", ProcessCount);
+    | extend Method = strcat("Process: certsvc.exe (", ProcessCount, " events)");
 
 let CertificateAuthorities =
     union CAsBySoftware, CAsByProcess
-    | summarize Methods = make_set(Method) by DeviceId, DeviceName
+    | summarize Methods = make_set(Method), MethodCount = dcount(Method) by DeviceId, DeviceName
     | extend
         Tier = 0,
         Category = "Certificate Authority",
         Confidence = iff(array_length(Methods) > 1, "High", "Medium"),
-        Evidence = strcat("Detection: ", tostring(Methods)),
+        Evidence = strcat("CA confirmed by ", MethodCount, " signal(s): ", strcat_array(Methods, " | ")),
         DetectionMethod = "MultiSignal";
 
 // AD FS Servers - Enhanced
@@ -218,26 +218,26 @@ let ADFSByProcess =
     | where FileName in~ ("Microsoft.IdentityServer.ServiceHost.exe", "AdfsSrv.exe")
     | summarize ProcessCount = count(), Processes = make_set(FileName) by DeviceId, DeviceName
     | where ProcessCount > 10
-    | extend Method = strcat("Processes:", tostring(Processes));
+    | extend Method = strcat("ADFS processes: ", tostring(Processes), " (", ProcessCount, " events)");
 
 let ADFSByPort =
     DeviceNetworkEvents
     | where Timestamp > ago(LookbackDays * 1d)
     | where ActionType == "ListeningConnectionCreated"
     | where LocalPort in (443, 49443)  // ADFS ports
-    | summarize Ports = make_set(LocalPort) by DeviceId, DeviceName
+    | summarize Ports = make_set(LocalPort), ConnectionCount = count() by DeviceId, DeviceName
     | where set_has_element(Ports, 443)
-    | extend Method = "ADFSPorts";
+    | extend Method = strcat("ADFS ports listening: ", tostring(Ports));
 
 let ADFSServers =
     union ADFSByProcess, ADFSByPort
-    | summarize Methods = make_set(Method) by DeviceId, DeviceName
-    | where tostring(Methods) has_any ("Processes", "Microsoft.IdentityServer")  // Must have process evidence
+    | summarize Methods = make_set(Method), MethodCount = dcount(Method) by DeviceId, DeviceName
+    | where tostring(Methods) has_any ("ADFS processes", "Microsoft.IdentityServer")  // Must have process evidence
     | extend
         Tier = 0,
         Category = "AD FS Server",
         Confidence = iff(array_length(Methods) > 1, "High", "Medium"),
-        Evidence = strcat("Detection: ", tostring(Methods)),
+        Evidence = strcat("AD FS confirmed by ", MethodCount, " signal(s): ", strcat_array(Methods, " | ")),
         DetectionMethod = "MultiSignal";
 
 // Entra Connect Servers - Enhanced
@@ -252,7 +252,7 @@ let EntraConnectServers =
         Tier = 0,
         Category = "Entra Connect Server",
         Confidence = "High",
-        Evidence = strcat("Entra Connect processes: ", tostring(Processes)),
+        Evidence = strcat("Entra Connect/AAD Sync: ", tostring(Processes), " (", ProcessCount, " events). Identity sync infrastructure detected."),
         DetectionMethod = "ProcessBased";
 
 let Tier0 = union DomainControllers, CertificateAuthorities, ADFSServers, EntraConnectServers;

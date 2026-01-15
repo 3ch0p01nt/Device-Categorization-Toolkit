@@ -780,13 +780,19 @@ let FinalOutput =
         // Primary category is the one with lowest tier
         Tier = coalesce(MinTier, iff(IsServerOS == true, 2, 3)),
         // Get primary category (first in the set after sorting by tier)
-        Category = coalesce(
+        PrimaryCategory = coalesce(
             iff(array_length(AllCategories) > 0, tostring(AllCategories[0]), ""),
             iff(IsServerOS == true, "Generic Server", "Standard Workstation")
+        )
+    | extend
+        Category = PrimaryCategory,
+        // Additional roles: remove primary category from all categories using set_difference
+        OtherRoles = set_difference(AllCategories, pack_array(PrimaryCategory)),
+        AdditionalRoles = iff(
+            array_length(set_difference(AllCategories, pack_array(PrimaryCategory))) > 0,
+            strcat_array(set_difference(AllCategories, pack_array(PrimaryCategory)), ", "),
+            ""
         ),
-        // Secondary categories (all others)
-        SecondaryCategory = iff(array_length(AllCategories) > 1,
-            strcat_array(array_slice(AllCategories, 1, array_length(AllCategories)), ", "), ""),
         // Count of roles detected
         RoleCount = iff(array_length(AllCategories) > 0, array_length(AllCategories), 1),
         // Confidence based on signal strength
@@ -811,7 +817,7 @@ FinalOutput
     DeviceId,
     Tier,
     Category,
-    SecondaryCategory,
+    AdditionalRoles,
     RoleCount,
     Confidence,
     DetectionMethod,

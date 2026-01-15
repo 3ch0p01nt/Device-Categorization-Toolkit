@@ -145,9 +145,11 @@ function Get-AccessToken {
         # Interactive device code authentication
         Write-Host "Authenticating with device code flow..." -ForegroundColor Yellow
 
-        # Use appropriate client ID for gov cloud
+        # Use appropriate client ID for each cloud
+        # Commercial: Microsoft Graph PowerShell (first-party app)
+        # GCC High/DoD: Azure CLI (cross-cloud compatible first-party app)
         $appClientId = if ($LoginUrl -like "*microsoftonline.us*") {
-            "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # May need gov-specific app ID
+            "04b07795-8ddb-461a-bbee-02f9e1bf7b46"  # Azure CLI - works in gov clouds
         } else {
             "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # Microsoft Graph PowerShell
         }
